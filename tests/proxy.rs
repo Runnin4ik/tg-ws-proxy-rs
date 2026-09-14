@@ -200,6 +200,149 @@ async fn cf_worker_is_tried_before_the_cf_proxy() {
     );
 }
 
+// ─── Pinned per-class upstream order ─────────────────────────────────────────
+
+#[tokio::test]
+async fn pinned_media_upstream_bypasses_cf_for_media_connections() {
+    // A media handshake carries a negative DC index, and --pinned-media-upstream
+    // owns its ladder: with `tcp` pinned, the configured CF tier must not even
+    // be attempted for a media connection.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "media-pin.example.net",
+            "--pinned-media-upstream",
+            "tcp",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(connect_targets(&requests), ["149.154.167.51:443"]);
+}
+
+#[tokio::test]
+async fn pinned_media_upstream_leaves_non_media_connections_on_the_default_ladder() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-medpin.example.dev",
+            "--cf-domain",
+            "medpin.example.net",
+            "--pinned-media-upstream",
+            "tcp",
+        ],
+    );
+
+    // DC 2 with a positive index: non-media, so the default order applies —
+    // Worker, both CF domain variants, then the TCP fallback.
+    run_proxy_once_for_dc(config, 2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "worker-medpin.example.dev:443",
+            "kws2.medpin.example.net:443",
+            "kws2-1.medpin.example.net:443",
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn media_connections_inherit_a_non_media_only_pin() {
+    // --pinned-upstream without --pinned-media-upstream must pin media too:
+    // letting media slip back to the default ladder would undo the egress
+    // decision the operator made with the single flag.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "inherit.example.net",
+            "--pinned-upstream",
+            "tcp",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(connect_targets(&requests), ["149.154.167.51:443"]);
+}
+
+#[tokio::test]
+async fn pinned_upstream_reorders_the_ladder_for_non_media_connections() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-pin.example.dev",
+            "--cf-domain",
+            "pin.example.net",
+            // Default order would be Worker → CF; the pin flips it.
+            "--pinned-upstream",
+            "cfproxy,cfworker,tcp",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "kws2.pin.example.net:443",
+            "kws2-1.pin.example.net:443",
+            "worker-pin.example.dev:443",
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_with_no_working_tier_drops_the_connection() {
+    // `mtproto` pinned but no --mtproto-proxy configured: nothing outbound
+    // may be attempted, and the unlisted tiers (CF, TCP) must not rescue the
+    // connection — pinning is explicit opt-in.  The probe listens for a short
+    // window rather than awaiting a shared fixture, which would block for its
+    // whole quiet period waiting for a first CONNECT that must never come.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let probe = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_millis(500), listener.accept()).await {
+            Ok(Ok((mut stream, _))) => common::read_http_connect_request(&mut stream).await,
+            Ok(Err(e)) => panic!("accept failed: {e}"),
+            Err(_) => String::new(),
+        }
+    });
+
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "unused.example.net",
+            "--pinned-media-upstream",
+            "mtproto",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let request = common::await_task(probe).await;
+    assert!(
+        request.is_empty(),
+        "expected no outbound attempt, got {request:?}"
+    );
+}
+
 #[tokio::test]
 async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
     // With --dc-ip set the direct WS path is normally first; --cf-priority
@@ -216,7 +359,8 @@ async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
             "--ws-connect-timeout",
             "2",
         ],
-    );
+    )
+    .with_defaults();
 
     run_proxy_once(config).await;
 
