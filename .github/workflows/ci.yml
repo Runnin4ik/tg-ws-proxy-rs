@@ -512,6 +512,29 @@ jobs:
       # creates its AVD from scratch, which is also the only way this job's
       # result means the same thing on every run.
 
+      # `script:` below has to name the package to ask the device about, and
+      # output-metadata.json is where AGP records the id it actually built.
+      # Read here rather than there because the emulator runner splits `script`
+      # on newlines and runs each line as its own `sh -c`, so nothing set on
+      # one line survives to the next.
+      - name: Read the debug applicationId
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=app/build/outputs/apk/debug
+          # Assigned first, not inlined into the echo: a command substitution
+          # that fails inside another command leaves `set -e` nothing to catch,
+          # and APP_ID=null would only surface as an empty `pm path` later.
+          app_id="$(jq -er '.applicationId' "$out/output-metadata.json")"
+          echo "APP_ID=$app_id" >> "$GITHUB_ENV"
+
+      # The suite and the APK pull live in a script file, not in `script:`
+      # below. The runner wraps each line it is given in `sh -c "<line>"`, so a
+      # line with double quotes of its own -- which `adb pull "$(adb shell pm
+      # path ...)"` cannot avoid -- is cut short at the first inner quote. The
+      # file also puts `set -euo pipefail` around both commands rather than
+      # leaving a failed suite's visibility to the action's execution model.
       - name: Run instrumentation tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -523,6 +546,39 @@ jobs:
           disable-animations: true
           working-directory: android
           script: bash ../.github/scripts/run-connected-tests.sh
+
+      # The splits leave the debug variant with two installable outputs --
+      # app-x86_64-debug.apk and app-universal-debug.apk -- and AGP, not this
+      # workflow, picks between them. Only the split runs the per-ABI packaging
+      # path that "Check the packaged JNI symbols" over in the `android` job
+      # exists to protect; a green run against the universal APK would mean the
+      # emulator never loaded the artifact those assertions were about, and
+      # nothing would say so. Identify the installed APK by hash, so this
+      # names a file rather than trusting one.
+      - name: Check which APK the tests ran against
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=app/build/outputs/apk/debug
+          want="$(sha256sum "$RUNNER_TEMP/installed.apk" | cut -d' ' -f1)"
+          matched=()
+          while read -r candidate; do
+            [[ "$(sha256sum "$out/$candidate" | cut -d' ' -f1)" == "$want" ]] &&
+              matched+=("$candidate")
+          done < <(jq -r '.elements[].outputFile' "$out/output-metadata.json")
+          if [[ "${#matched[@]}" -eq 0 ]]; then
+            echo "::error::the tests installed an APK this build did not" \
+              "produce (sha256 $want), expected app-x86_64-debug.apk"
+            exit 1
+          fi
+          echo "connectedDebugAndroidTest ran against: ${matched[*]}"
+          if [[ "${matched[*]}" != "app-x86_64-debug.apk" ]]; then
+            echo "::error::the tests installed ${matched[*]}, expected" \
+              "app-x86_64-debug.apk — the per-ABI split is the packaging this" \
+              "job exists to load on a device"
+            exit 1
+          fi
 
       # The Gradle failure message names the test but not why it failed; the
       # HTML report carries the assertion text and the logcat excerpt, which is
