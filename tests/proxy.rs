@@ -344,6 +344,78 @@ async fn a_pinned_ladder_with_no_working_tier_drops_the_connection() {
 }
 
 #[tokio::test]
+async fn a_single_tier_pin_redials_the_worker_through_its_cooldown() {
+    // One failed Worker dial arms CF_WORKER_FAIL for the whole cooldown
+    // window. In the default ladder that only buys a faster step to the next
+    // rung, but a `cfworker`-only pin has no next rung: the second
+    // connection must dial the Worker again rather than drop every
+    // connection at "every pinned upstream failed" for the whole window.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--pinned-upstream",
+                "cfworker",
+                "--cf-worker-domain",
+                "worker-cooldown.example.dev",
+            ],
+        )
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let worker_dials = requests
+        .iter()
+        .filter(|r| r.contains("worker-cooldown.example.dev"))
+        .count();
+    assert_eq!(
+        worker_dials, 2,
+        "both connections must dial the pinned Worker: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_cooldown_still_steps_over_when_a_later_tier_remains() {
+    // The last-resort bypass must not disarm the cooldown's purpose: with a
+    // later attemptable tier in the pin, the earlier rung stays a
+    // "prefer to step over" hint. Connection 1 dials the Worker (fails,
+    // arms the cooldown) then the upstream. Connection 2 skips the cooled
+    // Worker and goes straight to the upstream — its own last resort, so it
+    // is dialed even though connection 1 just armed its cooldown too.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--pinned-upstream",
+                "cfworker,mtproto",
+                "--cf-worker-domain",
+                "worker-hint.example.dev",
+                "--mtproto-proxy",
+                &format!("upstream-hint.example:443:{SECRET}"),
+            ],
+        )
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "worker-hint.example.dev:443",
+            "upstream-hint.example:443",
+            "upstream-hint.example:443",
+        ],
+        "cooldown must step over the Worker but force the last tier: {requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
     // With --dc-ip set the direct WS path is normally first; --cf-priority
     // flips that, and the CF tier is then not retried after WS also fails.

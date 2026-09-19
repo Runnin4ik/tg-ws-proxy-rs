@@ -799,12 +799,21 @@ impl Route<'_> {
     /// user can see the pin referring to nothing.  When every listed tier
     /// fails, the connection is dropped: pinning is opt-in, so tiers the user
     /// left out are not quietly re-added as fallbacks.
+    ///
+    /// The one departure from the default cooldown behavior is on the last
+    /// tier that can still connect: the Worker and upstream-MTProto rungs
+    /// dial through their cooldown there instead of skipping.  In the default
+    /// ladder a cooldown only buys a faster step to the next rung, and the
+    /// terminal TCP rung always attempts; a pin has no next rung, so
+    /// respecting the skip would turn one transient failure into a
+    /// cooldown-length outage with nothing left to clear it.
     async fn pinned_ladder(
         &self,
         tiers: &[UpstreamTier],
         target_ip: Option<&str>,
     ) -> Option<Upstream> {
-        for tier in tiers {
+        for (index, tier) in tiers.iter().enumerate() {
+            let last_resort = !self.tier_attemptable_after(tiers, index + 1, target_ip);
             match tier {
                 UpstreamTier::Ws => {
                     let Some(target_ip) = target_ip else {
@@ -826,7 +835,7 @@ impl Route<'_> {
                         );
                         continue;
                     };
-                    if let Some(ws) = self.cf_worker(dst, "pinned").await {
+                    if let Some(ws) = self.cf_worker(dst, "pinned", last_resort).await {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Tunnel,
@@ -842,7 +851,7 @@ impl Route<'_> {
                     }
                 }
                 UpstreamTier::Mtproto => {
-                    if let Some(conn) = self.upstream_proxies("pinned").await {
+                    if let Some(conn) = self.upstream_proxies("pinned", last_resort).await {
                         return Some(Upstream::Mtproto(conn));
                     }
                 }
@@ -866,6 +875,27 @@ impl Route<'_> {
         None
     }
 
+    /// Whether any pinned tier after `from` can produce a connection at all.
+    ///
+    /// Mirrors the rungs' own skip conditions: `ws` needs a `--dc-ip` target,
+    /// the Cloudflare and upstream rungs need their configuration, `tcp`
+    /// needs any destination. This is what tells the cooldown-gated rungs
+    /// whether they are the ladder's last resort.
+    fn tier_attemptable_after(
+        &self,
+        tiers: &[UpstreamTier],
+        from: usize,
+        target_ip: Option<&str>,
+    ) -> bool {
+        tiers[from..].iter().any(|tier| match tier {
+            UpstreamTier::Ws => target_ip.is_some(),
+            UpstreamTier::Cfworker => !self.config.cf_worker_domains().is_empty(),
+            UpstreamTier::Cfproxy => !self.config.cf_domains.is_empty(),
+            UpstreamTier::Mtproto => !self.config.mtproto_proxies.is_empty(),
+            UpstreamTier::Tcp => target_ip.is_some() || self.runtime.fallback_ip(self.dc).is_some(),
+        })
+    }
+
     /// The Cloudflare Worker → Cloudflare proxy → upstream MTProto ladder,
     /// shared by both entry points into the fallback chain.
     ///
@@ -876,7 +906,9 @@ impl Route<'_> {
             return Some(upstream);
         }
 
-        self.upstream_proxies(reason).await.map(Upstream::Mtproto)
+        self.upstream_proxies(reason, false)
+            .await
+            .map(Upstream::Mtproto)
     }
 
     /// Both Cloudflare tiers in upstream's order: Worker tunnel first, then
@@ -887,7 +919,7 @@ impl Route<'_> {
     /// `--cf-priority` entirely and pay the full direct-WS timeout on every
     /// connection before reaching its only working path.
     async fn cf_tiers(&self, dst: &str, reason: &str) -> Option<Upstream> {
-        if let Some(ws) = self.cf_worker(dst, reason).await {
+        if let Some(ws) = self.cf_worker(dst, reason, false).await {
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Tunnel,
@@ -952,7 +984,10 @@ impl Route<'_> {
     }
 
     /// Try every configured Cloudflare Worker tunnel in `--cf-balance` order.
-    async fn cf_worker(&self, dst: &str, reason: &str) -> Option<TgWsStream> {
+    /// `force` dials through the per-domain failure cooldown — the pinned
+    /// ladder's last resort, where a skip would drop the connection rather
+    /// than reach a next rung.  The default ladder always passes `false`.
+    async fn cf_worker(&self, dst: &str, reason: &str, force: bool) -> Option<TgWsStream> {
         let worker_domains = self.config.cf_worker_domains();
         if worker_domains.is_empty() {
             return None;
@@ -985,7 +1020,7 @@ impl Route<'_> {
         );
 
         for worker_domain in domain_order(worker_domains, first_worker) {
-            if CF_WORKER_FAIL.active(worker_domain) {
+            if !force && CF_WORKER_FAIL.active(worker_domain) {
                 debug!(
                     "[{}] DC{}{} CF Worker {} in cooldown, skipping",
                     self.label, self.dc, self.media, worker_domain
@@ -1122,10 +1157,12 @@ impl Route<'_> {
     }
 
     /// Try each configured upstream MTProto proxy in order.
-    async fn upstream_proxies(&self, reason: &str) -> Option<UpstreamConnection> {
+    ///
+    /// `force` dials through the failure cooldown — see [`Self::cf_worker`].
+    async fn upstream_proxies(&self, reason: &str, force: bool) -> Option<UpstreamConnection> {
         for upstream in &self.config.mtproto_proxies {
             let key = upstream_key(&upstream.host, upstream.port);
-            if UPSTREAM_FAIL.active(key.as_str()) {
+            if !force && UPSTREAM_FAIL.active(key.as_str()) {
                 debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
                 continue;
             }
