@@ -760,7 +760,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
 
 impl Route<'_> {
     /// The direct-WebSocket rung shared by both ladders: pool first, then a
-    /// fresh connect (with the reactive fronting retry inside it).
+    /// fresh connect (fronted from the first attempt when configured).
     async fn direct_ws_tier(&self, target_ip: &str) -> Option<Upstream> {
         let pooled = self
             .pool

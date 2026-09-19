@@ -131,8 +131,8 @@ fn parse_mtproto_proxy(s: &str) -> Result<MtProtoProxy, String> {
 /// One rung of the fallback ladder, as nameable from the CLI.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 pub enum UpstreamTier {
-    /// Direct WebSocket to the DC's `--dc-ip` target (pool, fresh connect,
-    /// reactive fronting).
+    /// Direct WebSocket to the DC's `--dc-ip` target (pool, fresh connect;
+    /// fronted from the first attempt when `--fronting-domain` is set).
     Ws,
     /// Cloudflare Worker TCP tunnel (`--cf-worker-domain`).
     Cfworker,
