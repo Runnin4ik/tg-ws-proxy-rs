@@ -277,6 +277,44 @@ async fn cf_priority_tries_the_cf_worker_before_the_direct_websocket() {
 }
 
 #[tokio::test]
+async fn fronting_domain_is_applied_from_the_first_attempt() {
+    // #111: with --fronting-domain set, the first direct-WS ClientHello must
+    // already carry the fronted SNI — a reactive "front only after the real
+    // SNI times out" round-trip leaks telegram.org to a network that RSTs it
+    // on sight. Observable through the outbound proxy as the attempt count:
+    // the old reactive path dialed the DC IP with the real SNI and then once
+    // more fronted after the handshake stalled; fronted-first dials exactly
+    // once per hostname variant and moves on down the ladder.
+    const DC_IP: &str = "149.154.167.220";
+    let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DC_IP).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--dc-ip",
+            &format!("3:{DC_IP}"),
+            "--fronting-domain",
+            "front.example.org",
+            "--ws-connect-timeout",
+            "1",
+        ],
+    );
+
+    // DC 3 so this test's WS_FAIL cooldown state cannot collide with the
+    // sibling tests in this binary that share the process-wide maps.
+    run_proxy_once_for_dc(config, 3).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let dc_dials = connect_targets(&requests)
+        .iter()
+        .filter(|target| **target == format!("{DC_IP}:443"))
+        .count();
+    assert_eq!(
+        dc_dials, 2,
+        "expected exactly the two hostname variants with no reactive retry, got {requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
     // A DPI-blocked DC IP costs a full connect timeout per attempt. Paying
     // that on every connection is what leaves Telegram sitting in

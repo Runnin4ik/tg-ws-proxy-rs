@@ -425,54 +425,55 @@ pub struct Config {
     )]
     pub cf_fail_cooldown: u64,
 
-    /// Domain to present as the TLS SNI for the domain-fronting fallback,
-    /// used when direct WebSocket connects to a DC keep timing out (a sign
-    /// of SNI-based DPI blocking). The real DC IP and `Host` are still used —
+    /// Domain to always present as the TLS SNI for direct WebSocket
+    /// connections to a DC IP. The real DC IP and `Host` are still used —
     /// only the SNI is swapped for this unrelated, presumably-unblocked
     /// domain, e.g. `sprinthost.ru` (the value upstream tg-ws-proxy uses).
+    ///
+    /// When set, fronting is unconditional: the very first ClientHello
+    /// already carries the fronted SNI. A reactive, "front only after the
+    /// direct SNI times out" switch leaks the real `telegram.org` SNI first,
+    /// which networks that RST it on sight never let through (#111).
     ///
     /// **Only takes effect when `--dc-ip` is configured for that DC** — by
     /// design, matching upstream tg-ws-proxy exactly: fronting only ever
     /// applies to a direct connection to Telegram's real DC IP, never to the
     /// CF proxy/Worker/upstream-proxy paths. If you rely solely on
     /// `--cf-domain`/`--default-domains` (no `--dc-ip`), this flag has no
-    /// effect — upstream's own troubleshooting guidance for a network where
-    /// Telegram's IPs are blocked outright (where fronting can't help, since
-    /// it still needs a real TCP connection to that IP) is to leave
-    /// `--dc-ip` unset entirely so this path is never attempted.
+    /// effect.
     ///
     /// Disabled unless set. TLS certificate verification is unconditionally
-    /// skipped on connections using this fallback: the real Telegram
-    /// certificate can never match a fronted SNI, so hostname verification
-    /// would always fail — this is inherent to the technique, not a bug.
-    ///
-    /// Once a fronted connection succeeds, the fallback stays active for
-    /// `--fronting-cooldown` seconds so new connections (including
-    /// background pool refills) keep using it.
+    /// skipped on fronted connections: the real Telegram certificate can
+    /// never match a fronted SNI, so hostname verification would always fail
+    /// — this is inherent to the technique, not a bug.
     #[arg(long = "fronting-domain", env = "TG_FRONTING_DOMAIN")]
     pub fronting_domain: Option<String>,
 
-    /// Seconds to keep the domain-fronting fallback active after it last
-    /// succeeded, before returning to normal direct WebSocket attempts.
+    /// Legacy: the sticky window that kept fronting active after a success.
+    ///
+    /// Fronting is now unconditional while `--fronting-domain` is set, so
+    /// there is no window to size. Kept parseable — and hidden — only for
+    /// already-deployed configs (LuCI UCI options, systemd units with
+    /// `TG_FRONTING_COOLDOWN`); the value is ignored.
     #[arg(
         long = "fronting-cooldown",
         default_value = "1800",
-        env = "TG_FRONTING_COOLDOWN"
+        env = "TG_FRONTING_COOLDOWN",
+        hide = true
     )]
     pub fronting_cooldown: u64,
 
-    /// Seconds to stop retrying the domain-fronting fallback after it fails.
+    /// Legacy: the cooldown after a failed fronting attempt.
     ///
-    /// Fronting only helps against SNI-based DPI blocking — it does nothing
-    /// for a network that blocks Telegram's DC IPs outright (the fronted
-    /// attempt still has to open a real TCP connection to that IP). Without
-    /// this cooldown, every connection to that DC would retry fronting from
-    /// scratch and pay a full `--ws-connect-timeout` for a doomed attempt on
-    /// top of the already doomed direct/CF/upstream/TCP attempts.
+    /// Fronting is now unconditional while `--fronting-domain` is set, so a
+    /// failed fronted connect is just a failed direct-WS attempt like any
+    /// other. Kept parseable — and hidden — only for already-deployed
+    /// configs; the value is ignored.
     #[arg(
         long = "fronting-fail-cooldown",
         default_value = "60",
-        env = "TG_FRONTING_FAIL_COOLDOWN"
+        env = "TG_FRONTING_FAIL_COOLDOWN",
+        hide = true
     )]
     pub fronting_fail_cooldown: u64,
 

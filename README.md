@@ -194,9 +194,7 @@ tg-ws-proxy [OPTIONS]
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
 | `--cf-disable-tls` | off | Use plaintext `ws://` on port 80 for CF proxy and Worker connections; direct Telegram WS remains TLS |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
-| `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` |
-| `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
-| `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails for a DC (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
+| `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
