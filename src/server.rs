@@ -104,10 +104,7 @@ pub async fn run_with_listen(
     let outbound = config
         .outbound_connector()
         .map_err(RunError::InvalidOutbound)?;
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
-        config.fronting_domain.clone(),
-        Duration::from_secs(config.fronting_cooldown),
-    ));
+    let runtime = Arc::new(Runtime::new(outbound).with_fronting(config.fronting_domain.clone()));
 
     tokio::pin!(shutdown);
 
@@ -301,10 +298,7 @@ pub async fn run_with_listen(
                 domain
             );
         } else {
-            info!(
-                "  Domain fronting: enabled (SNI {}, sticky for {}s after success)",
-                domain, config.fronting_cooldown
-            );
+            info!("  Domain fronting: always (SNI {})", domain);
         }
     }
 

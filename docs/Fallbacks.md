@@ -240,12 +240,11 @@ it will still start normally.
 
 ## Domain fronting
 
-If direct WebSocket connections to Telegram keep timing out — a common sign of
-SNI-based DPI blocking — the proxy can fall back to **domain fronting**:
-presenting an unrelated, presumably-unblocked domain as the TLS SNI while still
-connecting to the real Telegram DC IP and using the real DC domain as the HTTP
-`Host`. DPI that filters by SNI sees the fronted name; the actual
-(TLS-encrypted) request still reaches Telegram normally.
+On networks where SNI-based DPI blocks Telegram, **domain fronting** presents
+an unrelated, presumably-unblocked domain as the TLS SNI while still connecting
+to the real Telegram DC IP and using the real DC domain as the HTTP `Host`.
+DPI that filters by SNI sees the fronted name; the actual (TLS-encrypted)
+request still reaches Telegram normally.
 
 ```bash
 tg-ws-proxy --dc-ip 2:149.154.167.220 --fronting-domain sprinthost.ru
@@ -261,21 +260,20 @@ for a network that blocks Telegram's IPs outright (where fronting can't help
 either, since it still needs a real TCP connection to that IP) is to leave
 `--dc-ip` unset entirely.
 
-Disabled unless `--fronting-domain` is set. Once a fronted connection succeeds,
-the fallback stays active (including for background connection-pool refills)
-for `--fronting-cooldown` seconds (default 1800 = 30 min), so the proxy doesn't
-keep re-probing the likely-still-blocked direct path on every new connection. If
-a fronting attempt fails, `--fronting-fail-cooldown` seconds (default 60) pass
-before it's retried for that DC — otherwise a network where fronting can never
-succeed (e.g. the DC IP itself is blocked) would pay for a doomed attempt on
-every single connection.
+Disabled unless `--fronting-domain` is set. When set, fronting is
+**unconditional**: every direct-WebSocket attempt — including pool pre-connects
+— starts with the fronted SNI. An earlier version fronted reactively (real SNI
+first, fronted retry after a timeout), which never worked on networks that
+RST the real `telegram.org` SNI on sight: the leak happened before the retry
+could help (#111). If a fronted attempt fails, it counts as a normal direct-WS
+failure (`--ws-fail-cooldown`) and the ladder moves on.
 
 > **Note:** TLS certificate verification is unconditionally skipped on
-> connections using this fallback, regardless of
-> `--danger-accept-invalid-certs` — the real Telegram certificate can never
-> match a fronted SNI, so hostname verification would always fail. This is
-> inherent to the technique, not a bug, and only applies to the direct-WS
-> fallback path (not CF proxy/Worker connections).
+> fronted connections, regardless of `--danger-accept-invalid-certs` — the
+> real Telegram certificate can never match a fronted SNI, so hostname
+> verification would always fail. This is inherent to the technique, not a
+> bug, and only applies to the direct-WS path (not CF proxy/Worker
+> connections).
 
 ## Upstream MTProto proxy fallback
 

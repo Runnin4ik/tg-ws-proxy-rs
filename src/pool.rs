@@ -512,15 +512,10 @@ impl WsPool {
         let mut results = Vec::new();
         // Limit pool fill timeout to avoid blocking for too long.
         let timeout = Duration::from_secs(8);
-        // While the domain-fronting fallback is in its sticky window, warm the
-        // pool with fronted connections too — otherwise a pool hit would hand
-        // a client a connection that never had to front in the first place,
-        // defeating the point of staying "sticky".
-        let fronting_domain = self
-            .runtime
-            .fronting_active()
-            .then(|| self.runtime.fronting_domain())
-            .flatten();
+        // Warm the pool fronted when --fronting-domain is set: a pooled
+        // connection dialed with the real SNI would leak it to the network
+        // the operator asked to hide it from (#111).
+        let fronting_domain = self.runtime.fronting_domain();
 
         let mut attempts = stream::iter(0..count)
             .map(|_| {
