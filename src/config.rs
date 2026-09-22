@@ -562,6 +562,23 @@ pub struct Config {
     #[arg(long = "check", env = "TG_CHECK")]
     pub check: bool,
 
+    /// Also probe this proxy's own listener, end-to-end, then exit.
+    ///
+    /// A client-side obfuscated handshake and a real `req_pq_multi` are sent to
+    /// the listener the config serves on — `127.0.0.1`, or the address given
+    /// with `--host` — and the reply has to decrypt to Telegram's `resPQ`.
+    /// This is the only probe that covers the whole chain: the inbound
+    /// handshake, the upstream tier the routing picks and the DC itself.  A
+    /// handshake the listener merely accepts proves nothing, because it accepts
+    /// it before it has anywhere to forward the connection.
+    ///
+    /// The secret has to be the one the running proxy serves (`--secret` /
+    /// `TG_SECRET`).  A listener started with `--listen-faketls-domain` is
+    /// reported as skipped rather than failed: its first byte is a TLS record,
+    /// so a plain probe would only report a failure the user cannot act on.
+    #[arg(long = "check-listener", env = "TG_CHECK_LISTENER")]
+    pub check_listener: bool,
+
     /// Use the default Cloudflare-proxy domain list from the upstream repository.
     ///
     /// When set, the proxy fetches an obfuscated list of working CF proxy

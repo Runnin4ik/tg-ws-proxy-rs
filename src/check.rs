@@ -27,10 +27,20 @@
 //! with HMAC authentication is sent first.  The probe waits for the server's
 //! fake TLS handshake response; a successful drain confirms both reachability
 //! and correct protocol support.
+//!
+//! **Own listener** (`--check-listener`) — The probe talks to the listener this
+//! config serves on the way a client would: a 64-byte obfuscated handshake,
+//! then a real `req_pq_multi`, and the reply has to decrypt to Telegram's
+//! `resPQ`.  A handshake the listener merely accepts is not the verdict here,
+//! for the same reason the Worker probe sends an init: the listener accepts
+//! those 64 bytes before it has anywhere to forward them, so only the DC's
+//! answer says the chain — inbound handshake, chosen tier, DC — works.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncWriteExt;
+use cipher::StreamCipher;
+use rand::RngCore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{Config, MtProtoProxy, default_dc_ip};
 use crate::crypto::{self, ProtoTag, generate_client_handshake};
@@ -66,6 +76,84 @@ impl ProbeStatus {
     fn is_ok(&self) -> bool {
         matches!(self, Self::Ok(_))
     }
+}
+
+// ─── Listener probe request ───────────────────────────────────────────────────
+
+/// Telegram's `resPQ` constructor: the answer to `req_pq_multi`, and the only
+/// proof that the far end of a tunnel is a data centre rather than a middlebox
+/// that accepted the handshake.
+const RES_PQ_CTOR: u32 = 0x0516_2463;
+
+/// Byte offset of the constructor in a plain MTProto frame: 4 bytes of frame
+/// length, 8 of `auth_key_id`, 8 of message id, 4 of body length.
+const FRAME_CTOR_OFFSET: usize = 24;
+
+/// Header of a plain MTProto frame — enough bytes to read the constructor.
+const FRAME_HEADER_LEN: usize = FRAME_CTOR_OFFSET + 4;
+
+/// Telegram proxy secrets carry 16 bytes of key.
+const SECRET_KEY_LEN: usize = 16;
+
+/// Address to reach our own listener on: the bind address, unless it is a
+/// wildcard — which is not a destination.
+fn listener_probe_host(config: &Config) -> String {
+    match config.bind_host().as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// A `req_pq_multi` request in the padded-intermediate transport.
+///
+/// This is what a client sends once the obfuscation handshake is done: 8 zero
+/// bytes where an established session would carry `auth_key_id`, then the
+/// message id, the body length and the body — length-prefixed and padded to a
+/// multiple of 4, the shape the splitter reads off the wire.
+fn build_req_pq_multi() -> Vec<u8> {
+    const REQ_PQ_MULTI_CTOR: u32 = 0xbe7e_8ef1;
+
+    // `unixtime << 32`, as the protocol defines it.  Telegram only needs the id
+    // to move forward within a session, and this request is a single one.
+    let msg_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        << 32;
+
+    let mut nonce = [0u8; 16];
+    rand::rng().fill_bytes(&mut nonce);
+
+    let mut body = Vec::with_capacity(4 + nonce.len());
+    body.extend_from_slice(&REQ_PQ_MULTI_CTOR.to_le_bytes());
+    body.extend_from_slice(&nonce);
+
+    let mut packet = Vec::with_capacity(8 + 8 + 4 + body.len());
+    packet.extend_from_slice(&[0u8; 8]);
+    packet.extend_from_slice(&msg_id.to_le_bytes());
+    packet.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    packet.extend_from_slice(&body);
+
+    let padding = (4 - packet.len() % 4) % 4;
+    let mut frame = Vec::with_capacity(4 + packet.len() + padding);
+    frame.extend_from_slice(&((packet.len() + padding) as u32).to_le_bytes());
+    frame.extend_from_slice(&packet);
+    frame.resize(frame.len() + padding, 0);
+    frame
+}
+
+/// True when the decrypted reply is Telegram's `resPQ`.
+fn reply_is_res_pq(plain: &[u8]) -> bool {
+    let Some(header) = plain.get(..FRAME_HEADER_LEN) else {
+        return false;
+    };
+
+    let mut auth_key_id = [0u8; 8];
+    auth_key_id.copy_from_slice(&header[4..12]);
+    let mut ctor = [0u8; 4];
+    ctor.copy_from_slice(&header[FRAME_CTOR_OFFSET..FRAME_HEADER_LEN]);
+
+    u64::from_le_bytes(auth_key_id) == 0 && u32::from_le_bytes(ctor) == RES_PQ_CTOR
 }
 
 // ─── Individual probes ────────────────────────────────────────────────────────
@@ -236,6 +324,73 @@ async fn probe_mtproto_proxy(
     ProbeStatus::Ok(start.elapsed())
 }
 
+/// Probe the listener this config serves on, the way a client would.
+///
+/// Connects, sends the obfuscation handshake and a real `req_pq_multi`, and
+/// requires the reply to decrypt to `resPQ`.  Nothing weaker will do: the
+/// listener accepts a handshake before it has anywhere to forward the
+/// connection, so a successful send says only that the socket is open — the
+/// trap the Worker probe hit in #93.
+async fn probe_listener(
+    host: &str,
+    port: u16,
+    secret: &[u8],
+    dc_idx: i16,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
+    let start = Instant::now();
+
+    let stream = match outbound.connect(host, port, timeout).await {
+        Ok(stream) => stream,
+        Err(e) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
+    };
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+
+    let (handshake, mut enc, mut dec) =
+        generate_client_handshake(secret, dc_idx, ProtoTag::PaddedIntermediate);
+    if let Err(e) = writer.write_all(&handshake).await {
+        return ProbeStatus::Fail(format!("send MTProto handshake: {}", e));
+    }
+
+    let mut request = build_req_pq_multi();
+    enc.apply_keystream(&mut request);
+    if let Err(e) = writer.write_all(&request).await {
+        return ProbeStatus::Fail(format!("send req_pq_multi: {}", e));
+    }
+
+    // Read until the frame header is complete.  Telegram stays silent until it
+    // has the request, and the proxy's pool may still be coming up, so this
+    // waits the handshake budget rather than the shorter connect budget.
+    let mut plain = Vec::with_capacity(FRAME_HEADER_LEN);
+    let mut chunk = [0u8; 256];
+    let read = tokio::time::timeout(timeout, async {
+        while plain.len() < FRAME_HEADER_LEN {
+            match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    dec.apply_keystream(&mut chunk[..read]);
+                    plain.extend_from_slice(&chunk[..read]);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match read {
+        Err(_) => ProbeStatus::Fail(format!("no reply within {}s", timeout.as_secs())),
+        Ok(Err(e)) => ProbeStatus::Fail(format!("read from listener: {}", e)),
+        Ok(Ok(())) if reply_is_res_pq(&plain) => ProbeStatus::Ok(start.elapsed()),
+        Ok(Ok(())) => ProbeStatus::Fail(format!(
+            "reply is not resPQ ({} bytes received)",
+            plain.len()
+        )),
+    }
+}
+
 // ─── Proxy kind label ─────────────────────────────────────────────────────────
 
 fn proxy_kind(proxy: &MtProtoProxy) -> &'static str {
@@ -286,10 +441,14 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
     if config.cf_domains.is_empty()
         && cf_worker_domains.is_empty()
         && config.mtproto_proxies.is_empty()
+        && !config.check_listener
     {
         println!();
         println!("  Nothing to check.");
-        println!("  Configure --cf-domain, --cf-worker-domain and/or --mtproto-proxy and re-run.");
+        println!(
+            "  Configure --cf-domain, --cf-worker-domain, --mtproto-proxy \
+             and/or --check-listener and re-run."
+        );
         println!("{}", sep);
         return true;
     }
@@ -365,6 +524,49 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
         }
     }
 
+    // ── Own listener probe ────────────────────────────────────────────────
+    if config.check_listener {
+        println!();
+        println!("Own listener (end-to-end MTProto probe):");
+
+        let host = listener_probe_host(config);
+        print!("  {:40}  ... ", format!("{}:{}", host, config.port));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // `normalized_secrets` is already the decoded 16-byte key of each
+        // configured secret, with any `dd`/`ee` mode prefix stripped.
+        let secret = config
+            .normalized_secrets()
+            .first()
+            .filter(|key| key.len() == SECRET_KEY_LEN);
+
+        // A listener started with `--listen-faketls-domain` reads a TLS record
+        // before anything else, so it is skipped rather than failed: the plain
+        // probe cannot speak to it, and a failure would blame a config that
+        // works for its clients.
+        if config.normalized_listen_faketls_domain().is_some() {
+            println!("[SKIP]  FakeTLS listener: this probe speaks the plain transport");
+        } else if let Some(secret) = secret {
+            let status = probe_listener(
+                &host,
+                config.port,
+                secret,
+                // DC 2, as in the probes above: a representative data centre.
+                2,
+                Duration::from_secs(config.handshake_timeout),
+                outbound,
+            )
+            .await;
+            println!("[{}]  {}", status.marker(), status.detail());
+            if !status.is_ok() {
+                all_ok = false;
+            }
+        } else {
+            println!("[FAIL]  no --secret to probe with — pass the one the proxy serves");
+            all_ok = false;
+        }
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────
     println!();
     println!("{}", sep);
@@ -377,3 +579,6 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
 
     all_ok
 }
+
+#[cfg(test)]
+mod tests;

@@ -119,3 +119,59 @@ async fn check_fails_fast_on_an_invalid_upstream_secret() {
 
     assert!(parsed.is_err());
 }
+
+/// The listener probe fails when the listener accepts the connection and never
+/// answers: a handshake that was merely accepted is not a working proxy.
+#[tokio::test]
+async fn check_listener_fails_when_nothing_answers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let held = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        // Hold the connection open, so the probe has to time out instead of
+        // reading a close.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--check",
+        "--check-listener",
+        "--no-outbound-proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--handshake-timeout",
+        "1",
+    ])
+    .unwrap()
+    .with_defaults();
+    let outbound = config.outbound_connector().unwrap();
+
+    assert!(!run_check_with_outbound(&config, &outbound).await);
+    held.abort();
+}
+
+/// A listener configured for FakeTLS camouflage is skipped rather than failed:
+/// the plain probe cannot speak to it, and a failure would blame a config that
+/// works for its clients.
+#[tokio::test]
+async fn check_listener_skips_a_faketls_listener() {
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--check",
+        "--check-listener",
+        "--listen-faketls-domain",
+        "www.example.com",
+        "--secret",
+        "ee00112233445566778899aabbccddeeff7777772e6578616d706c652e636f6d",
+    ])
+    .unwrap()
+    .with_defaults();
+    let outbound = config.outbound_connector().unwrap();
+
+    assert!(run_check_with_outbound(&config, &outbound).await);
+}
