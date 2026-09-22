@@ -258,6 +258,9 @@ pub async fn run_with_listen(
         }
     }
 
+    if config.cf_disable_tls && (!config.cf_domains.is_empty() || !cf_worker_domains.is_empty()) {
+        info!("  Cloudflare transport: plaintext ws:// on port 80");
+    }
     if !config.pinned_upstreams.is_empty() || !config.pinned_media_upstreams.is_empty() {
         info!("  Pinned upstream order (default ladder is used for the rest):");
         let names = |tiers: &[UpstreamTier]| {
