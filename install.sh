@@ -7,12 +7,6 @@
 # Every installed path is suffixed with -rs so this port coexists with an
 # upstream tg-ws-proxy package; releases up to 2.2.3 used the unsuffixed names
 # and are migrated here.
-#
-# The two platforms are told apart by their own markers -- /etc/openwrt_release
-# on OpenWrt, the Entware root's opkg.conf anywhere else -- and share everything
-# up to the install step. Architecture detection, asset resolution and the
-# service model are the only places they diverge, and each divergence is
-# commented where it happens.
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; C='\033[0;36m'; N='\033[0m'
 ok()   { printf "${G}%s${N}\n" "$1"; }
@@ -164,20 +158,20 @@ binary_target() {
 
 # Entware names its architectures after the ABI they were built for, with a
 # version suffix and, on the Keenetic feeds, a `_kn` tag: mipsel-3.4_kn,
-# aarch64-3.10, armv7-3.2, x86_64-3.2. Each maps onto one of the release's musl
+# aarch64-3.10, armv7-3.2, x64-3.2. Each maps onto one of the release's musl
 # targets, so Entware answers the question /etc/openwrt_release answers on
 # OpenWrt -- which is why uname is not consulted: on MIPS it says "mips" for
-# both endians, and every Entware name already says which one it is. The
-# soft-float ARM names (armv7soft-*, armv5soft-*) deliberately fall through:
-# the release builds musleabihf, which needs VFP the cores behind those names
-# do not have.
+# both endians, and every Entware name already says which one it is. A name with
+# no release target falls through and is refused (armv5-3.2, x86-2.6). Entware's
+# ARMv7 feeds are soft-float builds that report armv7-3.2, which maps to
+# musleabihf here: a core without VFP is caught by the run check, not the name.
 entware_binary_target() {
 	case "$1" in
 		aarch64|aarch64-[0-9]*) printf '%s' aarch64-unknown-linux-musl ;;
 		armv7|armv7-[0-9]*) printf '%s' armv7-unknown-linux-musleabihf ;;
 		mipsel|mipsel-[0-9]*) printf '%s' mipsel-unknown-linux-musl ;;
 		mips|mips-[0-9]*) printf '%s' mips-unknown-linux-musl ;;
-		x86_64|x86_64-[0-9]*) printf '%s' x86_64-unknown-linux-musl ;;
+		x64|x64-[0-9]*) printf '%s' x86_64-unknown-linux-musl ;;
 		*) return 1 ;;
 	esac
 }
@@ -290,18 +284,14 @@ resolve_entware_environment() {
 	TARGET="$(entware_binary_target "$ARCH")" || die "unsupported Entware architecture: $ARCH"
 }
 
-# One attempt at one URL, through whichever downloader this box has: an Entware
-# install can carry curl and no wget, a stock firmware the reverse, and either
-# may be built without TLS -- BusyBox wget answers "not an http or ftp url" for
-# an https URL -- so both are tried before the attempt counts as failed. A
-# partial file is removed, because the size check that follows treats any
-# non-empty file as a download.
+# One attempt at one URL, through whichever downloader this box has: a box may
+# carry curl and no wget or the reverse, and either may be built without TLS
+# (BusyBox wget answers "not an http or ftp url" for an https URL).
 #
-# Neither downloader is given a total time limit: this fetches a couple of
+# What is bounded is the silence, not the total time: this fetches a couple of
 # megabytes from GitHub, which on a filtered network is minutes of progress
-# rather than a stall, and a cap would abort exactly the connections that are
-# working. What is bounded is the silence -- curl's --speed-time/--speed-limit
-# pair is the same guard as wget's --timeout=30.
+# rather than a stall, so curl's --speed-time/--speed-limit pair is the same
+# guard as wget's --timeout=30.
 dl_url() {
 	url="$1"
 	out="$2"
@@ -808,11 +798,9 @@ wait_ready() {
 # ---- Entware -----------------------------------------------------------------
 #
 # The service model here is rc.unslung: at boot the firmware sources every
-# executable S* file under <root>/etc/init.d, so the executable bit is what
-# enables the proxy and the init script is the whole integration. There is no
-# UCI, no procd and no LuCI to install into, which is why this path installs one
-# file beside the binary and one shell script, and never asks an opkg feed for
-# anything.
+# executable S* file under <root>/etc/init.d, so the executable bit is the
+# on/off switch and the init script is the whole integration -- no UCI, no
+# procd, no LuCI, and no opkg feed asked for anything.
 
 # The address the generated tg:// link should advertise. The binary detects one
 # itself when --link-ip is absent, and that is not always the one a LAN client
@@ -855,15 +843,10 @@ entware_new_secret() {
 	esac
 }
 
-# A secret that is already installed is never replaced: it is what every device
-# on the LAN is paired with.
-entware_installed_secret() {
-	[ -f "$ENTWARE_CONF_DIR/secret.conf" ] || return 0
-	sed -n 's/^SECRET=["]\{0,1\}\([0-9a-fA-F]\{32\}\)["]\{0,1\}.*/\1/p' "$ENTWARE_CONF_DIR/secret.conf" | sed -n '1p'
-}
-
 write_entware_config() {
 	mkdir -p "$ENTWARE_CONF_DIR" || return 1
+	# A secret that is already installed is never replaced: it is what every
+	# device on the LAN is paired with.
 	if [ ! -f "$ENTWARE_CONF_DIR/secret.conf" ]; then
 		secret="$(entware_new_secret)" || return 1
 		printf 'SECRET=%s\n' "$secret" > "$ENTWARE_CONF_DIR/secret.conf" || return 1
@@ -898,7 +881,8 @@ LINK_IP="$link_ip"
 # routing fallbacks.
 DEFAULT_DOMAINS="true"
 
-# quiet | info | verbose -- written to /var/log/tg-ws-proxy-rs.log below here.
+# quiet | info | verbose -- written to $ENTWARE_ROOT/var/log/tg-ws-proxy-rs.log
+# below here. "quiet" writes nothing at all, so status has no link to print.
 LOG_LEVEL="info"
 
 # Direct WebSocket target per DC, as DC:IP pairs, comma-separated, e.g.
@@ -933,6 +917,7 @@ write_entware_init() {
 	# here-document because every $ in it belongs to the script at run time.
 	sed "s|@ROOT@|$ENTWARE_ROOT|g" > "$ENTWARE_INIT" <<'EOF'
 #!/bin/sh
+# shellcheck disable=SC3037 # echo -e is BusyBox's; rc.unslung runs this with BusyBox sh.
 # Entware init script for tg-ws-proxy-rs.
 #
 # The executable bit is the switch: rc.unslung sources every executable S* file
@@ -980,17 +965,23 @@ load_config() {
 	fi
 
 	SCRATCH="/tmp/tg-ws-proxy-rs.conf.$$"
+	# The scratch copy holds the secret, so it is written under a mask that keeps
+	# it to root, and removed whether or not sourcing it worked.
+	scratch_umask="$(umask)"
+	umask 077
 	scrub_and_source() {
 		if command -v tr >/dev/null 2>&1; then
 			tr -d '\r' < "$1" > "$SCRATCH"
 		else
 			sed 's/\r$//' < "$1" > "$SCRATCH"
 		fi
+		# shellcheck source=/dev/null
 		. "$SCRATCH"
 	}
-	scrub_and_source "$CONFIG_FILE" || return 1
-	scrub_and_source "$SECRET_FILE" || return 1
+	scrub_and_source "$CONFIG_FILE" || { rm -f "$SCRATCH"; umask "$scratch_umask"; return 1; }
+	scrub_and_source "$SECRET_FILE" || { rm -f "$SCRATCH"; umask "$scratch_umask"; return 1; }
 	rm -f "$SCRATCH"
+	umask "$scratch_umask"
 
 	[ -n "${HOST+x}" ] || HOST=""
 	[ -n "${PORT+x}" ] || PORT=""
@@ -1027,11 +1018,21 @@ export_environment() {
 	return 0
 }
 
-# One run per log file, the previous kept as .1: the readiness probe below
-# reads a banner out of the log, and a banner from an earlier run must not be
-# able to answer for this one.
+# One run per log file, the previous kept as .1: print_link reads the link out of
+# the log, and a link from an earlier run must not be able to answer for this
+# one. A run's log over LOG_MAX is kept as its last LOG_TAIL bytes instead --
+# the proxy holds the file open while it runs, so a cap can only be applied
+# here, and /opt is often a small partition or a stick.
+LOG_MAX=1048576
+LOG_TAIL=65536
 rotate_log() {
 	[ -s "$LOGFILE" ] || return 0
+	size="$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)"
+	if [ "$size" -gt "$LOG_MAX" ]; then
+		tail -c "$LOG_TAIL" "$LOGFILE" > "$LOGFILE.1" 2>/dev/null || rm -f "$LOGFILE.1"
+		rm -f "$LOGFILE"
+		return 0
+	fi
 	mv -f "$LOGFILE" "$LOGFILE.1"
 	return 0
 }
@@ -1042,6 +1043,21 @@ print_link() {
 	echo -e "$ansi_blue Connect link: $link $ansi_std"
 	log "Connect link: $link"
 	return 0
+}
+
+# A bound listener is what readiness means here, not a line in the log: with
+# LOG_LEVEL="quiet" the proxy writes nothing at all, so waiting on a banner
+# would call a healthy proxy failed. The banner is only where the link comes
+# from, which is why a start with no link still succeeds.
+listener_ready() {
+	port="$PORT"
+	[ -n "$port" ] || port=1443
+	netstat -lnt 2>/dev/null | (
+		while IFS= read -r line; do
+			case "$line" in *":$port "*) exit 0 ;; esac
+		done
+		exit 1
+	)
 }
 
 start() {
@@ -1071,20 +1087,21 @@ start() {
 		IFS="$old_ifs"
 	fi
 
+	# shellcheck disable=SC2086 # EXTRA_ARGS is a list of arguments, not one.
 	"$PROG" "$@" $EXTRA_ARGS >/dev/null 2>&1 &
 
 	tries=0
 	while [ "$tries" -lt 15 ]; do
 		pidof $PROCS >/dev/null 2>&1 || break
-		grep -q 'Listening on' "$LOGFILE" 2>/dev/null && break
+		listener_ready && break
 		sleep 1
 		tries=$((tries + 1))
 	done
 
-	if pidof $PROCS >/dev/null 2>&1 && grep -q 'Listening on' "$LOGFILE" 2>/dev/null; then
+	if pidof $PROCS >/dev/null 2>&1 && listener_ready; then
 		echo -e "            $ansi_green done. $ansi_std"
 		log "Started $DESC${CALLER:+ from $CALLER}."
-		print_link
+		print_link || true
 		return 0
 	fi
 
@@ -1163,13 +1180,12 @@ find_entware_legacy_init() {
 	return 1
 }
 
-# Another MTProto proxy on this box -- the Go port, the Python original -- wants
-# the port this one is about to bind, and a service that cannot bind has not
-# failed loudly: it starts, logs a bind error and does nothing while the caller
-# sees a healthy process. So the other build is stopped and its init script's
-# executable bit cleared, leaving the file and its configuration in place; a
-# rollback puts the bit back. The OpenWrt path does the same with the 2.2.3
-# package it supersedes.
+# Another MTProto proxy on this box -- the Go port, the one whose process is
+# named tg-ws-proxy -- wants the port this one is about to bind, and a proxy
+# that cannot bind has not failed loudly: it starts, logs a bind error and does
+# nothing while the caller sees a healthy process. So it is stopped and its init
+# script's executable bit cleared, leaving its files and configuration alone; a
+# rollback puts the bit back.
 #
 # Called after this port's own service is down, so a port still held at that
 # point is held by the other build and the check cannot mistake this one for it.

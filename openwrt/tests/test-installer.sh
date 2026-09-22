@@ -251,10 +251,13 @@ for mapping in \
 	mipsel:mipsel-unknown-linux-musl \
 	mipsel-3.4:mipsel-unknown-linux-musl \
 	mipsel-3.4_kn:mipsel-unknown-linux-musl \
+	mipsel-3x:mipsel-unknown-linux-musl \
 	mips-3.4:mips-unknown-linux-musl \
+	mips-3x:mips-unknown-linux-musl \
 	aarch64-3.10:aarch64-unknown-linux-musl \
 	armv7-3.2:armv7-unknown-linux-musleabihf \
-	x86_64-3.2:x86_64-unknown-linux-musl; do
+	armv7-2.6:armv7-unknown-linux-musleabihf \
+	x64-3.2:x86_64-unknown-linux-musl; do
 	arch="${mapping%%:*}"
 	target="${mapping#*:}"
 	[[ "$(entware_binary_target "$arch")" == "$target" ]] || {
@@ -262,8 +265,11 @@ for mapping in \
 		exit 1
 	}
 done
-# Soft-float ARM names carry no VFP, and the release builds musleabihf.
-for arch in armv7soft-3.2 armv5soft-2.6; do
+# A name with no release target is refused rather than installed and crashed:
+# ARMv5, the 32-bit x86 feed, and x86_64-3.2 (Entware calls that arch x64-3.2).
+# The ARMv7 feeds are soft-float builds reporting armv7-*, which map to
+# musleabihf: a core without VFP is caught by the run check, not by the name.
+for arch in armv5-3.2 x86-2.6 x86_64-3.2; do
 	if entware_binary_target "$arch" >/dev/null 2>&1; then
 		printf 'FAIL: unsupported Entware target %s was accepted\n' "$arch" >&2
 		exit 1
@@ -353,6 +359,15 @@ if grep -q '@ROOT@' "$ENTWARE_INIT"; then
 fi
 bash -n "$ENTWARE_INIT" || {
 	printf 'FAIL: the generated init script does not parse\n' >&2
+	exit 1
+}
+# rc.unslung runs it with BusyBox sh, not bash, so it is checked as sh.
+command -v shellcheck >/dev/null 2>&1 || {
+	printf 'FAIL: shellcheck is required to check the generated init script\n' >&2
+	exit 1
+}
+shellcheck -s sh "$ENTWARE_INIT" || {
+	printf 'FAIL: shellcheck reported issues in the generated init script\n' >&2
 	exit 1
 }
 grep -Fq "PROG=$entware_root/bin/tg-ws-proxy-rs" "$ENTWARE_INIT" || {
