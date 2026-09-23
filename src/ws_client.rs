@@ -986,7 +986,6 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
 /// Used by the pool to re-open the exact route that just served a client,
 /// skipping the per-DC record expansion and the `-1`/base fallback dance that
 /// [`connect_cf_ws_for_dc_with_outbound`] performs on a cold connect.
-///
 pub async fn connect_cf_record_with_outbound(
     record: &str,
     skip_tls_verify: bool,
