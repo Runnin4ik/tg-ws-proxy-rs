@@ -56,7 +56,7 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_mode,
+    TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
 
@@ -1034,7 +1034,7 @@ impl Route<'_> {
                 self.label, self.dc, self.media, reason, worker_domain, dst
             );
 
-            let ws = connect_cf_worker_ws_for_dc_with_outbound_mode(
+            let ws = connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode(
                 worker_domain,
                 dst,
                 self.dc,
@@ -1042,6 +1042,7 @@ impl Route<'_> {
                 self.config.skip_tls_verify,
                 self.timeouts.cf_connect,
                 self.runtime.outbound(),
+                self.runtime.cf_ips(),
                 self.config.cf_disable_tls,
             )
             .await;
@@ -1131,6 +1132,7 @@ impl Route<'_> {
             self.timeouts.cf_connect,
             self.runtime.outbound(),
             first_domain,
+            self.runtime.cf_ips(),
             self.config.cf_disable_tls,
         )
         .await;

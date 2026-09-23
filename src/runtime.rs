@@ -5,11 +5,16 @@
 //! pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
+use std::net::IpAddr;
+
 use crate::config::{default_dc_ip, websocket_dc};
 use crate::outbound::OutboundConnector;
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    /// Preferred Cloudflare edges from `--cf-ip`. Empty means DNS picks the
+    /// anycast edge as usual.
+    cf_ips: Vec<IpAddr>,
     /// Domain-fronting SNI, when enabled via `--fronting-domain`. `None` means
     /// fronting is disabled entirely; `Some` means every direct-WebSocket
     /// connect presents it as the SNI — unconditionally, with no trigger
@@ -23,8 +28,15 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            cf_ips: Vec::new(),
             fronting_domain: None,
         }
+    }
+
+    /// Configure preferred Cloudflare edges (`--cf-ip`).
+    pub fn with_cf_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.cf_ips = ips;
+        self
     }
 
     /// Configure domain fronting. `domain: None` keeps it disabled.
@@ -35,6 +47,10 @@ impl Runtime {
 
     pub fn outbound(&self) -> &OutboundConnector {
         &self.outbound
+    }
+
+    pub fn cf_ips(&self) -> &[IpAddr] {
+        &self.cf_ips
     }
 
     pub fn websocket_dc(&self, dc: u32) -> u32 {

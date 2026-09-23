@@ -28,6 +28,7 @@
 //! fake TLS handshake response; a successful drain confirms both reachability
 //! and correct protocol support.
 
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
@@ -37,8 +38,8 @@ use crate::crypto::{self, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
-    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_cf_ws_for_dc_with_outbound_mode,
-    ws_recv, ws_send,
+    connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode,
+    connect_cf_ws_for_dc_with_outbound_and_ips_mode, ws_recv, ws_send,
 };
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
@@ -80,25 +81,29 @@ async fn probe_cf_domain(
     skip_tls: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    cf_ips: &[IpAddr],
     disable_tls: bool,
 ) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound_mode(
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound_and_ips_mode(
         2,
         &[domain.to_string()],
         false,
         skip_tls,
         timeout,
         outbound,
+        cf_ips,
         disable_tls,
     )
     .await;
     if ws.is_some() {
         ProbeStatus::Ok(start.elapsed())
     } else {
-        ProbeStatus::Fail(
-            "WebSocket connection failed — check DNS records and Cloudflare settings".to_string(),
-        )
+        ProbeStatus::Fail(if cf_ips.is_empty() {
+            "WebSocket connection failed — check DNS records and Cloudflare settings".to_string()
+        } else {
+            "WebSocket connection failed through every --cf-ip — check the preferred IPs and Cloudflare settings".to_string()
+        })
     }
 }
 
@@ -125,6 +130,7 @@ async fn probe_cf_worker(
     skip_tls: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    cf_ips: &[IpAddr],
     disable_tls: bool,
 ) -> ProbeStatus {
     let Some(dst) = default_dc_ip(2) else {
@@ -132,7 +138,7 @@ async fn probe_cf_worker(
     };
 
     let start = Instant::now();
-    let ws = connect_cf_worker_ws_for_dc_with_outbound_mode(
+    let ws = connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode(
         domain,
         dst,
         2,
@@ -140,13 +146,16 @@ async fn probe_cf_worker(
         skip_tls,
         timeout,
         outbound,
+        cf_ips,
         disable_tls,
     )
     .await;
     let Some(mut ws) = ws else {
-        return ProbeStatus::Fail(
-            "Worker WebSocket tunnel failed — check Worker code and domain".to_string(),
-        );
+        return ProbeStatus::Fail(if cf_ips.is_empty() {
+            "Worker WebSocket tunnel failed — check Worker code and domain".to_string()
+        } else {
+            "Worker WebSocket tunnel failed through every --cf-ip — check the preferred IPs and Worker code".to_string()
+        });
     };
 
     let relay_init = crypto::generate_relay_init(ProtoTag::Intermediate, 2);
@@ -311,6 +320,7 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
                 skip_tls,
                 cf_timeout,
                 outbound,
+                &config.cf_ips,
                 config.cf_disable_tls,
             )
             .await;
@@ -335,6 +345,7 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
                 skip_tls,
                 cf_timeout,
                 outbound,
+                &config.cf_ips,
                 config.cf_disable_tls,
             )
             .await;
