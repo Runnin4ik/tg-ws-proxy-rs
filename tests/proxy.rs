@@ -417,7 +417,7 @@ async fn a_pinned_cooldown_still_steps_over_when_a_later_tier_remains() {
 }
 
 #[tokio::test]
-async fn cf_ip_bypasses_dns_and_tries_every_edge_for_the_cf_proxy() {
+async fn cf_ip_does_not_cool_an_edge_for_an_http_proxy_error() {
     let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = proxy_config(
         &format!("http://{proxy_addr}"),

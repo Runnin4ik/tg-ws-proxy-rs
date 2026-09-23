@@ -296,6 +296,7 @@ pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()
     let runtime = Arc::new(
         Runtime::new(outbound)
             .with_cf_ips(config.cf_ips.clone())
+            .with_cf_fail_cooldown(Duration::from_secs(config.cf_fail_cooldown))
             .with_fronting(config.fronting_domain.clone()),
     );
     let pool = Arc::new(WsPool::with_runtime(

@@ -31,9 +31,8 @@ use crate::config::{Config, UpstreamTier};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
-    TgWsStream, connect_cf_record_with_outbound_and_ips_mode,
-    connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode, connect_ws_for_dc_with_outbound,
-    media_tag,
+    CfDialOpts, TgWsStream, connect_cf_record_with_outbound_opts,
+    connect_cf_worker_ws_for_dc_with_outbound_opts, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 /// Idle Cloudflare connections kept per `(tier, dc, is_media)`.
@@ -485,7 +484,7 @@ impl WsPool {
     async fn cf_connect_one(&self, target: &CfTarget) -> Option<TgWsStream> {
         match target.tier {
             CfTier::Worker => {
-                connect_cf_worker_ws_for_dc_with_outbound_and_ips_mode(
+                connect_cf_worker_ws_for_dc_with_outbound_opts(
                     &target.domain,
                     &target.dst,
                     target.dc,
@@ -493,19 +492,25 @@ impl WsPool {
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
-                    self.runtime.cf_ips(),
-                    target.disable_tls,
+                    CfDialOpts {
+                        cf_ips: self.runtime.cf_ips(),
+                        disable_tls: target.disable_tls,
+                        fail_cooldown: self.runtime.cf_fail_cooldown(),
+                    },
                 )
                 .await
             }
             CfTier::Proxy => {
-                connect_cf_record_with_outbound_and_ips_mode(
+                connect_cf_record_with_outbound_opts(
                     &target.domain,
                     target.skip_tls_verify,
                     target.connect_timeout,
                     self.runtime.outbound(),
-                    self.runtime.cf_ips(),
-                    target.disable_tls,
+                    CfDialOpts {
+                        cf_ips: self.runtime.cf_ips(),
+                        disable_tls: target.disable_tls,
+                        fail_cooldown: self.runtime.cf_fail_cooldown(),
+                    },
                 )
                 .await
             }

@@ -107,6 +107,7 @@ pub async fn run_with_listen(
     let runtime = Arc::new(
         Runtime::new(outbound)
             .with_cf_ips(config.cf_ips.clone())
+            .with_cf_fail_cooldown(Duration::from_secs(config.cf_fail_cooldown))
             .with_fronting(config.fronting_domain.clone()),
     );
 

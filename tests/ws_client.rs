@@ -2,11 +2,11 @@ use std::time::Duration;
 
 use tg_ws_proxy_rs::outbound::OutboundConnector;
 use tg_ws_proxy_rs::ws_client::{
-    WsConnectResult, cf_worker_path, cf_ws_domains, connect_cf_record_with_outbound_mode,
-    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_worker_ws_for_dc_with_outbound_and_ips,
-    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_cf_ws_for_dc_with_outbound,
-    connect_cf_ws_for_dc_with_outbound_mode, connect_ws_for_dc_with_outbound,
-    connect_ws_with_outbound, ws_domains,
+    CfDialOpts, WsConnectResult, cf_worker_path, cf_ws_domains,
+    connect_cf_record_with_outbound_mode, connect_cf_worker_ws_for_dc_with_outbound,
+    connect_cf_worker_ws_for_dc_with_outbound_mode, connect_cf_worker_ws_for_dc_with_outbound_opts,
+    connect_cf_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound_mode,
+    connect_ws_for_dc_with_outbound, connect_ws_with_outbound, ws_domains,
 };
 
 mod common;
@@ -294,7 +294,7 @@ async fn cf_ip_ipv6_uses_a_bracketed_http_connect_authority() {
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
     let ips = ["2001:db8::10".parse().unwrap()];
 
-    let ws = connect_cf_worker_ws_for_dc_with_outbound_and_ips(
+    let ws = connect_cf_worker_ws_for_dc_with_outbound_opts(
         "worker.example.dev",
         "149.154.167.51",
         2,
@@ -302,7 +302,11 @@ async fn cf_ip_ipv6_uses_a_bracketed_http_connect_authority() {
         false,
         PROBE_TIMEOUT,
         &outbound,
-        &ips,
+        CfDialOpts {
+            cf_ips: &ips,
+            disable_tls: false,
+            fail_cooldown: Duration::from_secs(60),
+        },
     )
     .await;
 

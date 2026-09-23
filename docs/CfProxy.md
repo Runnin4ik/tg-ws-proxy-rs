@@ -108,7 +108,7 @@ in front of the ladder: `--pinned-upstream cfworker,cfproxy,ws,mtproto,tcp`
 `--cf-ip` bypasses Cloudflare DNS/anycast selection for both regular CF proxy
 and CF Worker connections. Supply one or more tested Cloudflare edge IPv4 or
 IPv6 addresses; each connection rotates the first candidate and then tries the
-whole list before failing:
+whole non-cooling list before failing:
 
 ```sh
 tg-ws-proxy --cf-domain yourdomain.com \
@@ -120,6 +120,11 @@ verification and routing to `kwsN.yourdomain.com` remain correct. The IP list
 is global because it selects a Cloudflare edge, not a Telegram DC. While set,
 CF connections never fall back to DNS; remove `--cf-ip` to restore normal
 DNS/anycast selection.
+
+The first failure can cost up to **N attempted hostnames × M preferred IPs ×
+`--cf-connect-timeout`**. Edges whose direct TCP connection times out then
+enter `--cf-fail-cooldown`; while all edges are cooling, one rotating candidate
+is still retried so the proxy can recover without a restart.
 
 ## Verifying your configuration with `--check`
 
