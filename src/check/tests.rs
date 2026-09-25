@@ -1,6 +1,13 @@
-//! Unit tests for the listener probe's request frame and reply check.
+//! Unit tests for the listener probe: its request frame, its reply check, and
+//! how it classifies what a listener sends back.
 
-use super::{FRAME_HEADER_LEN, build_req_pq_multi, reply_is_res_pq};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use super::{FRAME_HEADER_LEN, ProbeStatus, build_req_pq_multi, probe_listener, reply_is_res_pq};
+use crate::crypto;
 
 /// The frame a peer reads: a 4-byte length prefix, 8 zero bytes where a session
 /// would carry `auth_key_id`, the message id, the body length, and the body
@@ -61,4 +68,46 @@ fn only_a_zero_key_res_pq_reply_passes() {
         "short read"
     );
     assert!(!reply_is_res_pq(&[]));
+}
+
+/// A transport error is a framed packet — a 4-byte length of 4 and the negative
+/// code — so it must be read as one, not mistaken for a truncated frame and
+/// blamed on the routing.
+#[tokio::test]
+async fn a_framed_transport_error_is_reported_as_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let secret = [0x11u8; 16];
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let mut init = [0u8; crypto::HANDSHAKE_LEN];
+        stream.read_exact(&mut init).await.unwrap();
+        let info = crypto::parse_handshake(&init, &secret).expect("client handshake parses");
+        let relay_init = crypto::generate_relay_init(info.proto, info.dc_id as i16);
+        let mut ciphers =
+            crypto::build_connection_ciphers(&info.prekey_and_iv, &secret, &relay_init);
+
+        // Drain the whole request, so closing afterwards cannot reset the
+        // connection and discard the error still in the probe's buffer.
+        let mut request = [0u8; 44];
+        stream.read_exact(&mut request).await.unwrap();
+
+        let mut reply = [0u8; 8];
+        reply[..4].copy_from_slice(&4u32.to_le_bytes());
+        reply[4..8].copy_from_slice(&(-404i32).to_le_bytes());
+        crypto::apply_keystream(&mut ciphers.clt_enc, &mut reply);
+        stream.write_all(&reply).await.unwrap();
+    });
+
+    match probe_listener(addr, &secret, 2, Duration::from_secs(5)).await {
+        ProbeStatus::Fail(reason) => assert!(
+            reason.contains("transport error: -404"),
+            "unexpected reason: {reason}"
+        ),
+        ProbeStatus::Ok(elapsed) => panic!("expected a failure, got OK in {elapsed:?}"),
+    }
+
+    server.await.unwrap();
 }

@@ -190,6 +190,9 @@ async fn res_pq_listener(secret: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
         );
 
         let mut reply = [0u8; 28];
+        // A real frame carries its length: 4 bytes of prefix, then the 24-byte
+        // packet this fixture sends.
+        reply[..4].copy_from_slice(&24u32.to_le_bytes());
         reply[24..28].copy_from_slice(&0x0516_2463u32.to_le_bytes());
         crypto::apply_keystream(&mut ciphers.clt_enc, &mut reply);
         stream.write_all(&reply).await.unwrap();

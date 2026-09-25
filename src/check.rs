@@ -401,11 +401,12 @@ async fn probe_listener(
         Ok(Ok(())) if filled == 0 => ProbeStatus::Fail(
             "the listener closed without answering — no tier reached the DC".to_string(),
         ),
-        // MTProto reports a route that failed on the proxy's side with a 4-byte
-        // negative code (-404, -429) instead of a frame.
-        Ok(Ok(())) if filled == 4 => {
+        // A transport error arrives as an ordinary packet: a 4-byte length of 4
+        // followed by the negative code, so 8 bytes on the wire.  A bare
+        // 4-byte prefix is not an error — it is a truncated packet.
+        Ok(Ok(())) if filled >= 8 && header[..4] == 4u32.to_le_bytes() => {
             let mut code = [0u8; 4];
-            code.copy_from_slice(&header[..4]);
+            code.copy_from_slice(&header[4..8]);
             ProbeStatus::Fail(format!(
                 "the proxy reported a transport error: {}",
                 i32::from_le_bytes(code)
@@ -576,15 +577,20 @@ pub async fn run_check_with_outbound(
             }
             Some(addr) => {
                 let target = probe_addr(addr);
-                print!("  {:40}  ... ", target);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
+                // Printed after the probe returns, in one piece: in this mode
+                // the serving proxy logs to the same stdout, and the pool
+                // warm-up plus the probe's own connection would otherwise land
+                // in the middle of this line.
+                let label = format!("  {:40}  ... ", target);
 
                 // A listener configured for FakeTLS reads a TLS record before
                 // anything else, so it is skipped rather than failed: the plain
                 // probe cannot speak to it, and a failure would blame a config
                 // that works for its clients.
                 if config.normalized_listen_faketls_domain().is_some() {
-                    println!("[SKIP]  FakeTLS listener: this probe speaks the plain transport");
+                    println!(
+                        "{label}[SKIP]  FakeTLS listener: this probe speaks the plain transport"
+                    );
                     skipped += 1;
                 } else {
                     // A cold route can spend every connect timeout in the ladder
@@ -601,7 +607,7 @@ pub async fn run_check_with_outbound(
                     // DC 2, as in the probes above: a representative data centre.
                     let secret = config.secret_bytes();
                     let status = probe_listener(target, &secret, 2, reply_timeout).await;
-                    println!("[{}]  {}", status.marker(), status.detail());
+                    println!("{label}[{}]  {}", status.marker(), status.detail());
                     if !status.is_ok() {
                         all_ok = false;
                     }
