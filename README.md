@@ -265,6 +265,7 @@ tg-ws-proxy [OPTIONS]
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
+| `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |

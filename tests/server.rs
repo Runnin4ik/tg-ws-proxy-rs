@@ -132,3 +132,35 @@ async fn port_zero_reports_the_real_bound_port_in_the_link() {
         .expect("server task panicked")
         .expect("server returned an error");
 }
+
+/// `--check-listener` serves, probes the socket it just bound, and stops with
+/// the check's verdict: the accept loop has to end on it rather than keep
+/// serving, and the exit code has to be the check's.
+#[tokio::test]
+async fn check_listener_mode_stops_with_the_check_verdict() {
+    // A FakeTLS listener is skipped, so this run verifies nothing and has to
+    // fail — which is also the cheapest way to reach the verdict, with no
+    // network involved.
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--check-listener",
+        "--no-outbound-proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--quiet",
+        "--pool-size",
+        "0",
+        "--listen-faketls-domain",
+        "www.example.com",
+        "--secret",
+        "ee00112233445566778899aabbccddeeff7777772e6578616d706c652e636f6d",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let result = server::run_with_listen(config, std::future::pending(), |_| {}).await;
+
+    assert!(matches!(result, Err(server::RunError::CheckFailed)));
+}
