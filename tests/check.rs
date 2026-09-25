@@ -1,12 +1,17 @@
+use std::net::SocketAddr;
+
 use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinHandle;
 
 use tg_ws_proxy_rs::check::run_check_with_outbound;
 use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::crypto;
 
 mod common;
 
 use common::{
-    await_proxy_request, await_unit_task, mtproto_acceptor, rejecting_http_proxy,
+    await_proxy_request, await_task, await_unit_task, mtproto_acceptor, rejecting_http_proxy,
     tunneling_http_proxy,
 };
 
@@ -38,7 +43,7 @@ async fn check_reports_success_when_there_is_nothing_configured() {
     let config = Config::try_parse_from(["tg-ws-proxy", "--check"]).unwrap();
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(run_check_with_outbound(&config, &outbound).await);
+    assert!(run_check_with_outbound(&config, &outbound, None).await);
 }
 
 #[tokio::test]
@@ -50,7 +55,7 @@ async fn check_cf_domain_honors_disabled_tls() {
     );
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(!run_check_with_outbound(&config, &outbound).await);
+    assert!(!run_check_with_outbound(&config, &outbound, None).await);
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT kws2.example.net:80 HTTP/1.1"));
 }
@@ -64,7 +69,7 @@ async fn check_cf_worker_probes_the_dc2_tunnel_through_the_outbound_proxy() {
     );
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(!run_check_with_outbound(&config, &outbound).await);
+    assert!(!run_check_with_outbound(&config, &outbound, None).await);
     // The scheme and trailing slash are normalized away before the connect.
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT worker.example.dev:443 HTTP/1.1"));
@@ -82,7 +87,7 @@ async fn check_upstream_mtproto_uses_outbound_proxy() {
     );
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(!run_check_with_outbound(&config, &outbound).await);
+    assert!(!run_check_with_outbound(&config, &outbound, None).await);
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT upstream.example:443 HTTP/1.1"));
 }
@@ -100,7 +105,7 @@ async fn check_upstream_mtproto_successfully_tunnels_through_proxy() {
     );
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(run_check_with_outbound(&config, &outbound).await);
+    assert!(run_check_with_outbound(&config, &outbound, None).await);
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT upstream.example:443 HTTP/1.1"));
     await_unit_task(upstream_task).await;
@@ -120,58 +125,125 @@ async fn check_fails_fast_on_an_invalid_upstream_secret() {
     assert!(parsed.is_err());
 }
 
-/// The listener probe fails when the listener accepts the connection and never
-/// answers: a handshake that was merely accepted is not a working proxy.
-#[tokio::test]
-async fn check_listener_fails_when_nothing_answers() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let held = tokio::spawn(async move {
-        let (_stream, _) = listener.accept().await.unwrap();
-        // Hold the connection open, so the probe has to time out instead of
-        // reading a close.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    });
-
-    let config = Config::try_parse_from([
+/// A `--check --check-listener` config with every connect timeout at a second,
+/// so a probe that has to give up costs seconds instead of the sum of the
+/// defaults, and with proxy discovery off so the host's environment cannot
+/// change the outcome.
+fn listener_config(extra: &[&str]) -> Config {
+    let mut args = vec![
         "tg-ws-proxy",
         "--check",
         "--check-listener",
         "--no-outbound-proxy",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-        "--secret",
-        "00112233445566778899aabbccddeeff",
         "--handshake-timeout",
         "1",
-    ])
-    .unwrap()
-    .with_defaults();
+        "--ws-connect-timeout",
+        "1",
+        "--cf-connect-timeout",
+        "1",
+        "--upstream-connect-timeout",
+        "1",
+        "--tcp-fallback-timeout",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    Config::try_parse_from(args).unwrap().with_defaults()
+}
+
+/// A fake listener speaking the server half of the transport with the crate's
+/// own parsing and cipher construction: it reads the client handshake,
+/// decrypts the request with `clt_dec`, and answers with a `resPQ` frame
+/// encrypted with `clt_enc`.
+///
+/// That is what pins the round trip.  A swapped `enc`/`dec`, a wrong
+/// constructor offset or a mis-framed request fails here rather than only on a
+/// real network.
+async fn res_pq_listener(secret: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let mut init = [0u8; crypto::HANDSHAKE_LEN];
+        stream.read_exact(&mut init).await.unwrap();
+        let info = crypto::parse_handshake(&init, &secret).expect("client handshake parses");
+        let relay_init = crypto::generate_relay_init(info.proto, info.dc_id as i16);
+        let mut ciphers =
+            crypto::build_connection_ciphers(&info.prekey_and_iv, &secret, &relay_init);
+
+        // The whole 44-byte request: leaving its tail unread would reset the
+        // connection when the listener closes and discard the reply still
+        // sitting in the probe's receive buffer.
+        let mut request = [0u8; 44];
+        stream.read_exact(&mut request).await.unwrap();
+        crypto::apply_keystream(&mut ciphers.clt_dec, &mut request);
+        assert_eq!(
+            &request[4..12],
+            &[0u8; 8],
+            "no session key in a req_pq_multi"
+        );
+        assert_eq!(
+            &request[24..28],
+            &0xbe7e_8ef1u32.to_le_bytes(),
+            "the request is a req_pq_multi"
+        );
+
+        let mut reply = [0u8; 28];
+        reply[24..28].copy_from_slice(&0x0516_2463u32.to_le_bytes());
+        crypto::apply_keystream(&mut ciphers.clt_enc, &mut reply);
+        stream.write_all(&reply).await.unwrap();
+    });
+
+    (addr, task)
+}
+
+/// A listener that answers with `resPQ` is a pass — the round trip the probe
+/// exists for.
+#[tokio::test]
+async fn check_listener_reports_ok_when_the_listener_answers() {
+    let config = listener_config(&["--secret", "00112233445566778899aabbccddeeff"]);
+    let (addr, server) = res_pq_listener(config.secret_bytes()).await;
     let outbound = config.outbound_connector().unwrap();
 
-    assert!(!run_check_with_outbound(&config, &outbound).await);
+    assert!(run_check_with_outbound(&config, &outbound, Some(addr)).await);
+    await_task(server).await;
+}
+
+/// A listener that accepts the connection and never answers is a failure: a
+/// handshake that was merely accepted is not a working proxy.
+#[tokio::test]
+async fn check_listener_fails_when_nothing_answers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let held = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        // Hold the connection open, so the probe has to time out instead of
+        // reading a close.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let config = listener_config(&["--secret", "00112233445566778899aabbccddeeff"]);
+    let outbound = config.outbound_connector().unwrap();
+
+    assert!(!run_check_with_outbound(&config, &outbound, Some(addr)).await);
     held.abort();
 }
 
-/// A listener configured for FakeTLS camouflage is skipped rather than failed:
-/// the plain probe cannot speak to it, and a failure would blame a config that
-/// works for its clients.
+/// A FakeTLS listener is skipped rather than failed — the plain probe cannot
+/// speak to it — but a run whose only probe was skipped has verified nothing,
+/// so it must not report success.
 #[tokio::test]
-async fn check_listener_skips_a_faketls_listener() {
-    let config = Config::try_parse_from([
-        "tg-ws-proxy",
-        "--check",
-        "--check-listener",
+async fn check_listener_skips_a_faketls_listener_and_fails_the_run() {
+    let config = listener_config(&[
         "--listen-faketls-domain",
         "www.example.com",
         "--secret",
         "ee00112233445566778899aabbccddeeff7777772e6578616d706c652e636f6d",
-    ])
-    .unwrap()
-    .with_defaults();
+    ]);
     let outbound = config.outbound_connector().unwrap();
+    // Never dialled: the FakeTLS branch is decided before the probe connects.
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    assert!(run_check_with_outbound(&config, &outbound).await);
+    assert!(!run_check_with_outbound(&config, &outbound, Some(addr)).await);
 }

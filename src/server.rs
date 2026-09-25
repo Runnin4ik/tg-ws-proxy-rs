@@ -90,6 +90,16 @@ pub async fn run(
     run_with_listen(config, shutdown, |_| {}).await
 }
 
+/// Awaits a check's verdict when one is running, and never completes otherwise,
+/// so the accept loop can keep a single `select!` shape whether or not
+/// `--check-listener` asked for one.
+async fn check_verdict(rx: &mut Option<tokio::sync::oneshot::Receiver<bool>>) -> bool {
+    match rx {
+        Some(rx) => rx.await.unwrap_or(false),
+        None => std::future::pending().await,
+    }
+}
+
 /// [`run`] plus a one-shot callback after the listen socket is bound.
 ///
 /// `on_listen` is how an embedder learns the real port (when `--port 0`) and
@@ -162,10 +172,14 @@ pub async fn run_with_listen(
     // Run probes for every configured CF domain and MTProto proxy, print the
     // results, then return.  This lets the user verify their configuration
     // before starting the proxy server.
-    if config.check {
+    //
+    // With `--check-listener` there is a socket of our own to probe, so the
+    // check runs after the bind below instead, against the listener this
+    // process serves on.
+    if config.check && !config.check_listener {
         let all_ok = tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            all_ok = check::run_check_with_outbound(&config, runtime.outbound()) => all_ok,
+            all_ok = check::run_check_with_outbound(&config, runtime.outbound(), None) => all_ok,
         };
         return if all_ok {
             Ok(())
@@ -389,6 +403,30 @@ pub async fn run_with_listen(
         });
     }
 
+    // ── Own-listener check (--check --check-listener) ─────────────────────
+    // The probes run as a task, not before the bind: the listener probe has to
+    // be accepted by the loop below, so the two run together, and the loop
+    // stops on the verdict.  The socket handed over is the one just bound, so
+    // the secret, address and inbound mode are the ones being served rather
+    // than copies the user has to repeat.
+    let (check_tx, check_rx) = tokio::sync::oneshot::channel::<bool>();
+    let mut check_rx = Some(check_rx);
+    let _check_keep = if config.check {
+        let config = Arc::clone(&config);
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            let all_ok =
+                check::run_check_with_outbound(&config, runtime.outbound(), Some(bound_addr)).await;
+            let _ = check_tx.send(all_ok);
+        });
+        None
+    } else {
+        // Held for the life of the loop, so the receiver never resolves and the
+        // selects below keep one shape.
+        Some(check_tx)
+    };
+    let mut check_ok = None;
+
     // ── Accept loop ───────────────────────────────────────────────────────
     // Acquire a permit before each accept() to cap concurrent connections.
     // This prevents EMFILE (too many open files) by keeping file-descriptor
@@ -402,6 +440,10 @@ pub async fn run_with_listen(
         // TCP connections queue in the kernel backlog until capacity frees up.
         let permit = tokio::select! {
             _ = &mut shutdown => break,
+            all_ok = check_verdict(&mut check_rx) => {
+                check_ok = Some(all_ok);
+                break;
+            }
             permit = Arc::clone(&semaphore).acquire_owned() => {
                 permit.expect("semaphore closed unexpectedly")
             }
@@ -409,6 +451,10 @@ pub async fn run_with_listen(
 
         tokio::select! {
             _ = &mut shutdown => break,
+            all_ok = check_verdict(&mut check_rx) => {
+                check_ok = Some(all_ok);
+                break;
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
@@ -441,6 +487,14 @@ pub async fn run_with_listen(
                 }
             }
         }
+    }
+
+    if let Some(all_ok) = check_ok {
+        return if all_ok {
+            Ok(())
+        } else {
+            Err(RunError::CheckFailed)
+        };
     }
 
     info!("proxy stopped");

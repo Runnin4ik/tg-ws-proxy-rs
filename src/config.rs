@@ -586,20 +586,25 @@ pub struct Config {
     #[arg(long = "check", env = "TG_CHECK")]
     pub check: bool,
 
-    /// Also probe this proxy's own listener, end-to-end, then exit.
+    /// Also probe this proxy's own listener, end-to-end.
     ///
-    /// A client-side obfuscated handshake and a real `req_pq_multi` are sent to
-    /// the listener the config serves on — `127.0.0.1`, or the address given
-    /// with `--host` — and the reply has to decrypt to Telegram's `resPQ`.
-    /// This is the only probe that covers the whole chain: the inbound
-    /// handshake, the upstream tier the routing picks and the DC itself.  A
-    /// handshake the listener merely accepts proves nothing, because it accepts
-    /// it before it has anywhere to forward the connection.
+    /// The process binds and serves as usual, then probes the socket it just
+    /// bound with a client-side obfuscated handshake and a real `req_pq_multi`,
+    /// and requires the reply to decrypt to Telegram's `resPQ`.  This is the
+    /// only probe that covers the whole chain — the inbound handshake, the
+    /// upstream tier the routing picks and the DC itself — and because the
+    /// probe talks to this process's own socket, the secret, address and
+    /// inbound mode match the running config by construction.
     ///
-    /// The secret has to be the one the running proxy serves (`--secret` /
-    /// `TG_SECRET`).  A listener started with `--listen-faketls-domain` is
-    /// reported as skipped rather than failed: its first byte is a TLS record,
-    /// so a plain probe would only report a failure the user cannot act on.
+    /// Implies `--check`, and stops the process with the check's exit code.
+    /// What it covers is the listener and the routing, not the `tg://` link:
+    /// the probe reaches the bound socket over loopback, so a wrong `--link-ip`
+    /// or a blocked LAN port still passes.
+    ///
+    /// A listener configured with `--listen-faketls-domain` is reported as
+    /// skipped rather than failed: its first byte is a TLS record, so the plain
+    /// probe cannot speak to it.  A run whose only probe was skipped exits
+    /// non-zero, because nothing was verified.
     #[arg(long = "check-listener", env = "TG_CHECK_LISTENER")]
     pub check_listener: bool,
 
@@ -735,6 +740,14 @@ impl Config {
     /// argument list — tests, or anything embedding the library — goes through
     /// exactly the same normalization the binary does.
     pub fn with_defaults(mut self) -> Self {
+        // `--check-listener` promises "probe and exit", so it implies the check
+        // rather than being ignored when `--check` is absent — the flag is
+        // reachable from `config.conf` and container env, where a silent no-op
+        // is indistinguishable from a passing probe.
+        if self.check_listener {
+            self.check = true;
+        }
+
         // Normalize the Worker domains once, so the routing path can read them
         // as a plain slice.  Entries that normalize to nothing (empty values,
         // a bare scheme) are dropped rather than rejected — a stray comma in

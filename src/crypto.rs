@@ -235,6 +235,17 @@ pub fn make_cipher(key: &[u8], iv: &[u8]) -> AesCtr256 {
     AesCtr256::new_from_slices(key, iv).expect("key must be 32 bytes and iv must be 16 bytes")
 }
 
+/// Apply a cipher's keystream to `data` in place.
+///
+/// The one operation every caller of [`make_cipher`] and
+/// [`build_connection_ciphers`] needs, without the `cipher` crate's
+/// `StreamCipher` trait having to be in scope — which a caller outside this
+/// crate (an integration test speaking the server half of the transport, say)
+/// cannot bring in on its own.
+pub fn apply_keystream(cipher: &mut AesCtr256, data: &mut [u8]) {
+    cipher.apply_keystream(data);
+}
+
 // ─── Client handshake generation (our proxy acting as a client to upstream) ──
 
 /// Generate a 64-byte MTProto obfuscation handshake that our proxy sends to
