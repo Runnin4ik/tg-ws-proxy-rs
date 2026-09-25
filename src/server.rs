@@ -104,7 +104,12 @@ pub async fn run_with_listen(
     let outbound = config
         .outbound_connector()
         .map_err(RunError::InvalidOutbound)?;
-    let runtime = Arc::new(Runtime::new(outbound).with_fronting(config.fronting_domain.clone()));
+    let runtime = Arc::new(
+        Runtime::new(outbound)
+            .with_cf_ips(config.cf_ips.clone())
+            .with_cf_fail_cooldown(Duration::from_secs(config.cf_fail_cooldown))
+            .with_fronting(config.fronting_domain.clone()),
+    );
 
     tokio::pin!(shutdown);
 
@@ -259,7 +264,12 @@ pub async fn run_with_listen(
     }
 
     if config.cf_disable_tls && (!config.cf_domains.is_empty() || !cf_worker_domains.is_empty()) {
-        info!("  Cloudflare transport: plaintext ws:// on port 80");
+        warn!(
+            "  ⚠  CF transport: plaintext ws:// on port 80 — the obfuscated MTProto stream is \
+             on the wire in the clear: every frame's auth_key_id is readable and the \
+             obfuscation is recoverable from captured bytes (#123), so connections are \
+             identifiable. Route media through these tiers, not text."
+        );
     }
     if !config.pinned_upstreams.is_empty() || !config.pinned_media_upstreams.is_empty() {
         info!("  Pinned upstream order (default ladder is used for the rest):");
@@ -277,6 +287,24 @@ pub async fn run_with_listen(
             info!("    media: {}", names(&config.pinned_media_upstreams));
         } else if !config.pinned_upstreams.is_empty() {
             info!("    media: inherits non-media pin above");
+        }
+    }
+
+    if !config.cf_ips.is_empty() {
+        info!(
+            "  Cloudflare preferred IP(s): {}",
+            config
+                .cf_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if config.cf_domains.is_empty() && cf_worker_domains.is_empty() {
+            warn!(
+                "  ⚠  --cf-ip has no effect: no --cf-domain, --default-domains, \
+                 or --cf-worker-domain route is configured"
+            );
         }
     }
 

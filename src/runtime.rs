@@ -5,11 +5,18 @@
 //! pass-throughs to `config`, kept as methods so call sites can take
 //! everything they need from one place.
 
+use std::net::IpAddr;
+use std::time::Duration;
+
 use crate::config::{default_dc_ip, websocket_dc};
 use crate::outbound::OutboundConnector;
 
 pub struct Runtime {
     outbound: OutboundConnector,
+    /// Preferred Cloudflare edges from `--cf-ip`. Empty means DNS picks the
+    /// anycast edge as usual.
+    cf_ips: Vec<IpAddr>,
+    cf_fail_cooldown: Duration,
     /// Domain-fronting SNI, when enabled via `--fronting-domain`. `None` means
     /// fronting is disabled entirely; `Some` means every direct-WebSocket
     /// connect presents it as the SNI — unconditionally, with no trigger
@@ -23,8 +30,21 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
+            cf_ips: Vec::new(),
+            cf_fail_cooldown: Duration::from_secs(60),
             fronting_domain: None,
         }
+    }
+
+    /// Configure preferred Cloudflare edges (`--cf-ip`).
+    pub fn with_cf_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.cf_ips = ips;
+        self
+    }
+
+    pub fn with_cf_fail_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cf_fail_cooldown = cooldown;
+        self
     }
 
     /// Configure domain fronting. `domain: None` keeps it disabled.
@@ -35,6 +55,14 @@ impl Runtime {
 
     pub fn outbound(&self) -> &OutboundConnector {
         &self.outbound
+    }
+
+    pub fn cf_ips(&self) -> &[IpAddr] {
+        &self.cf_ips
+    }
+
+    pub fn cf_fail_cooldown(&self) -> Duration {
+        self.cf_fail_cooldown
     }
 
     pub fn websocket_dc(&self, dc: u32) -> u32 {

@@ -417,6 +417,73 @@ async fn a_pinned_cooldown_still_steps_over_when_a_later_tier_remains() {
 }
 
 #[tokio::test]
+async fn cf_ip_does_not_cool_an_edge_for_an_http_proxy_error() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "cfip.example.net",
+            "--cf-ip",
+            "203.0.113.10,198.51.100.20",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let targets = connect_targets(&requests);
+    assert_eq!(targets.len(), 5, "unexpected fallback shape: {targets:?}");
+    assert_eq!(
+        targets.iter().filter(|&&t| t == "203.0.113.10:443").count(),
+        2
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|&&t| t == "198.51.100.20:443")
+            .count(),
+        2
+    );
+    assert_eq!(targets.last(), Some(&"149.154.167.51:443"));
+    assert!(
+        targets
+            .iter()
+            .all(|target| !target.contains("cfip.example.net")),
+        "--cf-ip must never fall back to DNS: {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn cf_ip_bypasses_dns_and_tries_every_edge_for_the_worker() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-cfip.example.dev",
+            "--cf-ip",
+            "203.0.113.11,198.51.100.21",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let targets = connect_targets(&requests);
+    assert_eq!(targets.len(), 3, "unexpected fallback shape: {targets:?}");
+    assert!(targets[..2].contains(&"203.0.113.11:443"));
+    assert!(targets[..2].contains(&"198.51.100.21:443"));
+    assert_eq!(targets.last(), Some(&"149.154.167.51:443"));
+    assert!(
+        targets
+            .iter()
+            .all(|target| !target.contains("worker-cfip.example.dev")),
+        "--cf-ip must never fall back to DNS: {targets:?}"
+    );
+}
+
+#[tokio::test]
 async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
     // With --dc-ip set the direct WS path is normally first; --cf-priority
     // flips that, and the CF tier is then not retried after WS also fails.

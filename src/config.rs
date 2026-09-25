@@ -339,10 +339,11 @@ pub struct Config {
     /// `ws://` (port 80) instead of `wss://` (port 443).
     ///
     /// Useful when a TLS-MITM middlebox breaks the WebSocket upgrade to
-    /// Cloudflare but plain HTTP passes, or against a Cloudflare zone whose
-    /// SSL mode serves HTTP on port 80. The MTProto traffic inside is still
-    /// end-to-end encrypted by its own AES-CTR layer, so this exposes
-    /// transport metadata (SNI-less HTTP Host) rather than message content.
+    /// Cloudflare but plain HTTP passes. The cost: the obfuscated MTProto
+    /// stream is on the wire unencrypted — the 8-byte `auth_key_id` at the
+    /// front of every frame is readable and the obfuscation layer is
+    /// recoverable from captured bytes (#123), so each connection is
+    /// identifiable. Acceptable for media traffic; not for text.
     ///
     /// Applies to the `cfproxy` and `cfworker` tiers only — the direct
     /// WebSocket path to Telegram always uses TLS.
@@ -382,6 +383,29 @@ pub struct Config {
         env = "TG_PINNED_MEDIA_UPSTREAM"
     )]
     pub pinned_media_upstreams: Vec<UpstreamTier>,
+
+    /// Preferred Cloudflare edge IP(s) for the CF proxy and CF Worker tiers
+    /// (IPv4 or IPv6).
+    ///
+    /// When set, those tiers dial the next of these addresses instead of
+    /// resolving the `kws{N}` / Worker record — skipping whatever edge
+    /// DNS/anycast would have assigned. TLS SNI and HTTP `Host` still use the
+    /// real record, so certificates and routing inside Cloudflare are
+    /// unchanged. Multiple IPs are round-robined across dials (inline connects
+    /// and pool refills alike); typically fed from a latency scan of
+    /// Cloudflare's ranges for networks where the assigned edge is slow or
+    /// blocked.
+    ///
+    /// Applies to `--cf-domain`/`--default-domains` and `--cf-worker-domain`
+    /// connections only — never to direct-WS (`--dc-ip`), upstream MTProto
+    /// proxies, or the TCP fallback.
+    #[arg(
+        long = "cf-ip",
+        value_name = "IP",
+        value_delimiter = ',',
+        env = "TG_CF_IP"
+    )]
+    pub cf_ips: Vec<std::net::IpAddr>,
 
     // ── Timeout / cooldown knobs ─────────────────────────────────────────
     /// WebSocket connection timeout in seconds (normal path).

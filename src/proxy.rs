@@ -21,10 +21,7 @@
 //! client's own reader/writer halves only ever have to be moved into a single
 //! bridge call.
 
-use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::future::Future;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,7 +53,7 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_mode,
+    CfDialOpts, CooldownMap, TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_opts,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
 
@@ -94,55 +91,6 @@ const TLS_READ_HEADROOM: usize = 256;
 const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM;
 
 // ─── Failure cooldowns ───────────────────────────────────────────────────────
-
-/// Process-wide "do not retry until" deadlines for one fallback tier.
-///
-/// Each tier backs off independently after a failure so that a dead path is
-/// not re-probed on every single connection.  Cooldowns are deliberately used
-/// instead of a permanent blacklist: the proxy recovers on its own once the
-/// network changes (or Telegram's redirect policy does).
-struct CooldownMap<K> {
-    entries: StdMutex<Option<HashMap<K, Instant>>>,
-}
-
-impl<K: Eq + Hash> CooldownMap<K> {
-    const fn new() -> Self {
-        Self {
-            entries: StdMutex::new(None),
-        }
-    }
-
-    fn set(&self, key: K, cooldown: Duration) {
-        self.entries
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(key, Instant::now() + cooldown);
-    }
-
-    fn clear<Q>(&self, key: &Q)
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        if let Some(entries) = self.entries.lock().unwrap().as_mut() {
-            entries.remove(key);
-        }
-    }
-
-    /// Whether `key` is still inside its cooldown window.
-    fn active<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let entries = self.entries.lock().unwrap();
-        match entries.as_ref().and_then(|entries| entries.get(key)) {
-            Some(&until) => Instant::now() < until,
-            None => false,
-        }
-    }
-}
 
 /// Per-DC cooldown for the direct WebSocket path, keyed by `(dc, is_media)`.
 /// Also carries the longer "all domains redirected" cooldown.
@@ -1034,7 +982,7 @@ impl Route<'_> {
                 self.label, self.dc, self.media, reason, worker_domain, dst
             );
 
-            let ws = connect_cf_worker_ws_for_dc_with_outbound_mode(
+            let ws = connect_cf_worker_ws_for_dc_with_outbound_opts(
                 worker_domain,
                 dst,
                 self.dc,
@@ -1042,7 +990,11 @@ impl Route<'_> {
                 self.config.skip_tls_verify,
                 self.timeouts.cf_connect,
                 self.runtime.outbound(),
-                self.config.cf_disable_tls,
+                CfDialOpts {
+                    cf_ips: self.runtime.cf_ips(),
+                    disable_tls: self.config.cf_disable_tls,
+                    fail_cooldown: self.timeouts.cf_fail_cooldown,
+                },
             )
             .await;
 
@@ -1131,7 +1083,11 @@ impl Route<'_> {
             self.timeouts.cf_connect,
             self.runtime.outbound(),
             first_domain,
-            self.config.cf_disable_tls,
+            CfDialOpts {
+                cf_ips: self.runtime.cf_ips(),
+                disable_tls: self.config.cf_disable_tls,
+                fail_cooldown: self.timeouts.cf_fail_cooldown,
+            },
         )
         .await;
 
