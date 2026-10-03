@@ -101,6 +101,31 @@ fn cf_disable_tls_is_opt_in() {
 }
 
 #[test]
+fn cf_ips_accept_ipv4_ipv6_commas_and_repeated_flags() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cf-ip",
+        "203.0.113.10,2001:db8::10",
+        "--cf-ip",
+        "198.51.100.20",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        cfg.cf_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["203.0.113.10", "2001:db8::10", "198.51.100.20"]
+    );
+}
+
+#[test]
+fn cf_ips_reject_non_ip_values() {
+    assert!(Config::try_parse_from(["tg-ws-proxy", "--cf-ip", "edge.example.com"]).is_err());
+}
+
+#[test]
 fn default_host_binds_and_links_to_the_same_address() {
     // Regression test for https://github.com/valnesfjord/tg-ws-proxy-rs/issues/82:
     // without --host, the listener must bind to whatever address link_host()

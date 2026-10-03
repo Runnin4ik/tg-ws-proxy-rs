@@ -81,6 +81,40 @@ fn ordered_records_put_the_preferred_variant_first() {
     );
 }
 
+#[test]
+fn cf_ip_attempts_skip_edges_in_cooldown() {
+    let cooldowns = CooldownMap::new();
+    let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+    cooldowns.set(ips[0], Duration::from_secs(60));
+
+    assert_eq!(cf_ip_attempts(&ips, 0, &cooldowns, |_| true), [ips[1]]);
+}
+
+#[test]
+fn cf_ip_attempts_try_one_edge_when_every_edge_is_cooling() {
+    let cooldowns = CooldownMap::new();
+    let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+    for ip in ips {
+        cooldowns.set(ip, Duration::from_secs(60));
+    }
+
+    assert_eq!(cf_ip_attempts(&ips, 1, &cooldowns, |_| true), [ips[1]]);
+}
+
+#[test]
+fn cf_ip_attempts_ignore_direct_cooldowns_for_proxied_edges() {
+    let cooldowns = CooldownMap::new();
+    let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+    for ip in ips {
+        cooldowns.set(ip, Duration::from_secs(60));
+    }
+
+    assert_eq!(
+        cf_ip_attempts(&ips, 0, &cooldowns, |_| false),
+        [ips[0], ips[1]]
+    );
+}
+
 /// Regression test for the domain-fronting fallback (issue #81): the TLS SNI
 /// sent on the wire must be the fronted domain, while the WebSocket upgrade's
 /// `Host` header must still be the real one — and the handshake must succeed

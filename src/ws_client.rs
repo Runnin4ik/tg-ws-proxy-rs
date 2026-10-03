@@ -16,8 +16,13 @@
 //! used — matching the Python reference implementation which always passes
 //! `verify_mode = CERT_NONE`.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::config::websocket_dc;
 use crate::outbound::OutboundConnector;
@@ -48,6 +53,110 @@ pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// arguments readable at the ~30 call sites across the proxy.
 pub(crate) fn media_tag(is_media: bool) -> &'static str {
     if is_media { "m" } else { "" }
+}
+
+// ─── Preferred Cloudflare edge IPs (--cf-ip) ─────────────────────────────────
+
+/// Round-robin counter for `--cf-ip`, shared by every dial site so the load
+/// spreads across the preferred edges instead of hammering the first one.
+static CF_IP_ROTATION: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct CooldownMap<K> {
+    entries: StdMutex<Option<HashMap<K, Instant>>>,
+}
+
+impl<K: Eq + Hash> CooldownMap<K> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: StdMutex::new(None),
+        }
+    }
+
+    pub(crate) fn set(&self, key: K, cooldown: Duration) {
+        self.entries
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, Instant::now() + cooldown);
+    }
+
+    pub(crate) fn clear<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if let Some(entries) = self.entries.lock().unwrap().as_mut() {
+            entries.remove(key);
+        }
+    }
+
+    pub(crate) fn active<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let entries = self.entries.lock().unwrap();
+        match entries.as_ref().and_then(|entries| entries.get(key)) {
+            Some(&until) => Instant::now() < until,
+            None => false,
+        }
+    }
+}
+
+static CF_EDGE_TLS_FAIL: CooldownMap<IpAddr> = CooldownMap::new();
+static CF_EDGE_PLAINTEXT_FAIL: CooldownMap<IpAddr> = CooldownMap::new();
+
+/// Cloudflare-specific dial settings shared by proxy, Worker, and pool paths.
+#[derive(Clone, Copy)]
+pub struct CfDialOpts<'a> {
+    pub cf_ips: &'a [IpAddr],
+    pub disable_tls: bool,
+    pub fail_cooldown: Duration,
+}
+
+impl CfDialOpts<'_> {
+    const DEFAULT: Self = Self {
+        cf_ips: &[],
+        disable_tls: false,
+        fail_cooldown: Duration::ZERO,
+    };
+}
+
+/// Starting index for one logical Cloudflare connection. Every configured IP
+/// is still tried before failure; rotating only spreads which one gets first
+/// chance.
+fn cf_ip_start(ips: &[IpAddr]) -> usize {
+    if ips.len() <= 1 {
+        return 0;
+    }
+    CF_IP_ROTATION.fetch_add(1, AtomicOrdering::Relaxed) % ips.len()
+}
+
+fn cf_ip_attempts<F>(
+    ips: &[IpAddr],
+    first: usize,
+    cooldowns: &CooldownMap<IpAddr>,
+    uses_cooldown: F,
+) -> Vec<IpAddr>
+where
+    F: Fn(IpAddr) -> bool,
+{
+    let entries = cooldowns.entries.lock().unwrap();
+    let now = Instant::now();
+    let is_cooling = |ip: &IpAddr| {
+        uses_cooldown(*ip)
+            && entries
+                .as_ref()
+                .and_then(|entries| entries.get(ip))
+                .is_some_and(|&until| now < until)
+    };
+    let all_cooling = ips.iter().all(is_cooling);
+    let limit = if all_cooling { 1 } else { ips.len() };
+    (0..ips.len())
+        .map(move |offset| ips[(first + offset) % ips.len()])
+        .filter(|ip| all_cooling || !is_cooling(ip))
+        .take(limit)
+        .collect()
 }
 
 /// WebSocket domains for a given DC.
@@ -317,6 +426,96 @@ async fn connect_ws_with_path(
         }
         Err(_) => WsConnectResult::TimedOut,
     }
+}
+
+/// Connect to a Cloudflare hostname through the configured preferred edges.
+///
+/// With no preferred IPs, the hostname is dialled normally and DNS chooses
+/// Cloudflare's anycast edge. With `--cf-ip`, DNS is never used for the TCP
+/// destination: every configured address is attempted, starting at a rotating
+/// offset. `domain` remains the TLS SNI and HTTP `Host` on every attempt.
+#[allow(clippy::too_many_arguments)]
+async fn connect_cf_with_path(
+    domain: &str,
+    path: &str,
+    request_binary_subprotocol: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    opts: CfDialOpts<'_>,
+) -> WsConnectResult {
+    if opts.cf_ips.is_empty() {
+        return connect_ws_with_path(
+            domain,
+            domain,
+            path,
+            request_binary_subprotocol,
+            skip_tls_verify,
+            timeout,
+            outbound,
+            None,
+            opts.disable_tls,
+        )
+        .await;
+    }
+
+    let first = cf_ip_start(opts.cf_ips);
+    let port = if opts.disable_tls { 80 } else { 443 };
+    let cooldowns = if opts.disable_tls {
+        &CF_EDGE_PLAINTEXT_FAIL
+    } else {
+        &CF_EDGE_TLS_FAIL
+    };
+    let mut last_non_redirect = None;
+    let mut last_redirect = None;
+
+    for ip in cf_ip_attempts(opts.cf_ips, first, cooldowns, |ip| {
+        outbound.connects_directly(&ip.to_string(), port)
+    }) {
+        let target = ip.to_string();
+        let direct = outbound.connects_directly(&target, port);
+        debug!("CF edge trying {} for {}", ip, domain);
+        match connect_ws_with_path(
+            &target,
+            domain,
+            path,
+            request_binary_subprotocol,
+            skip_tls_verify,
+            timeout,
+            outbound,
+            None,
+            opts.disable_tls,
+        )
+        .await
+        {
+            WsConnectResult::Connected(ws) => {
+                cooldowns.clear(&ip);
+                return WsConnectResult::Connected(ws);
+            }
+            WsConnectResult::Redirect(code) => {
+                cooldowns.clear(&ip);
+                last_redirect = Some(code);
+            }
+            WsConnectResult::Failed(reason) => {
+                cooldowns.clear(&ip);
+                last_non_redirect = Some(WsConnectResult::Failed(reason));
+            }
+            WsConnectResult::TimedOut => {
+                cooldowns.clear(&ip);
+                last_non_redirect = Some(WsConnectResult::TimedOut);
+            }
+            WsConnectResult::ConnectTimedOut(reason) => {
+                if direct {
+                    cooldowns.set(ip, opts.fail_cooldown);
+                }
+                last_non_redirect = Some(WsConnectResult::ConnectTimedOut(reason));
+            }
+        }
+    }
+
+    last_non_redirect.unwrap_or_else(|| {
+        WsConnectResult::Redirect(last_redirect.expect("non-empty CF IP list attempted"))
+    })
 }
 
 /// Perform the TLS handshake (with optional SNI override) and the WebSocket
@@ -729,20 +928,21 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
-    connect_cf_ws_for_dc_with_outbound_mode(
+    connect_cf_ws_for_dc_with_outbound_opts(
         dc,
         cf_domains,
         is_media,
         skip_tls_verify,
         timeout,
         outbound,
-        false,
+        CfDialOpts::DEFAULT,
     )
     .await
 }
 
 /// Same as [`connect_cf_ws_for_dc_with_outbound`], optionally using plaintext
 /// `ws://` on port 80.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_cf_ws_for_dc_with_outbound_mode(
     dc: u32,
     cf_domains: &[String],
@@ -752,6 +952,32 @@ pub async fn connect_cf_ws_for_dc_with_outbound_mode(
     outbound: &OutboundConnector,
     disable_tls: bool,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
+    connect_cf_ws_for_dc_with_outbound_opts(
+        dc,
+        cf_domains,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        CfDialOpts {
+            disable_tls,
+            ..CfDialOpts::DEFAULT
+        },
+    )
+    .await
+}
+
+/// Same as [`connect_cf_ws_for_dc_with_outbound`], with Cloudflare dial options.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_cf_ws_for_dc_with_outbound_opts(
+    dc: u32,
+    cf_domains: &[String],
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    opts: CfDialOpts<'_>,
+) -> (Option<TgWsStream>, Option<String>, bool) {
     connect_cf_ws_for_dc_with_outbound_ordered(
         dc,
         cf_domains,
@@ -760,7 +986,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound_mode(
         timeout,
         outbound,
         0,
-        disable_tls,
+        opts,
     )
     .await
 }
@@ -774,7 +1000,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     timeout: Duration,
     outbound: &OutboundConnector,
     first_domain: usize,
-    disable_tls: bool,
+    opts: CfDialOpts<'_>,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
@@ -783,16 +1009,14 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);
 
-        // Pass the CF domain as the TCP host so that Tokio's DNS resolution
-        // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_outbound_mode(
+        match connect_cf_with_path(
             &domain,
-            &domain,
+            "/apiws",
+            true,
             skip_tls_verify,
             timeout,
             outbound,
-            None,
-            disable_tls,
+            opts,
         )
         .await
         {
@@ -845,7 +1069,14 @@ pub async fn connect_cf_record_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
-    connect_cf_record_with_outbound_mode(record, skip_tls_verify, timeout, outbound, false).await
+    connect_cf_record_with_outbound_opts(
+        record,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        CfDialOpts::DEFAULT,
+    )
+    .await
 }
 
 /// Same as [`connect_cf_record_with_outbound`], optionally using plaintext
@@ -857,14 +1088,35 @@ pub async fn connect_cf_record_with_outbound_mode(
     outbound: &OutboundConnector,
     disable_tls: bool,
 ) -> Option<TgWsStream> {
-    match connect_ws_with_outbound_mode(
-        record,
+    connect_cf_record_with_outbound_opts(
         record,
         skip_tls_verify,
         timeout,
         outbound,
-        None,
-        disable_tls,
+        CfDialOpts {
+            disable_tls,
+            ..CfDialOpts::DEFAULT
+        },
+    )
+    .await
+}
+
+/// Same as [`connect_cf_record_with_outbound`], with Cloudflare dial options.
+pub async fn connect_cf_record_with_outbound_opts(
+    record: &str,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    opts: CfDialOpts<'_>,
+) -> Option<TgWsStream> {
+    match connect_cf_with_path(
+        record,
+        "/apiws",
+        true,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        opts,
     )
     .await
     {
@@ -911,7 +1163,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
-    connect_cf_worker_ws_for_dc_with_outbound_mode(
+    connect_cf_worker_ws_for_dc_with_outbound_opts(
         worker_domain,
         dst,
         dc,
@@ -919,7 +1171,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         skip_tls_verify,
         timeout,
         outbound,
-        false,
+        CfDialOpts::DEFAULT,
     )
     .await
 }
@@ -937,6 +1189,35 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_mode(
     outbound: &OutboundConnector,
     disable_tls: bool,
 ) -> Option<TgWsStream> {
+    connect_cf_worker_ws_for_dc_with_outbound_opts(
+        worker_domain,
+        dst,
+        dc,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        CfDialOpts {
+            disable_tls,
+            ..CfDialOpts::DEFAULT
+        },
+    )
+    .await
+}
+
+/// Same as [`connect_cf_worker_ws_for_dc_with_outbound`], with Cloudflare dial
+/// options.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
+    worker_domain: &str,
+    dst: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    opts: CfDialOpts<'_>,
+) -> Option<TgWsStream> {
     let path = cf_worker_path(dst, dc, is_media);
     let media = media_tag(is_media);
     debug!(
@@ -944,16 +1225,14 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_mode(
         dc, media, dst, worker_domain
     );
 
-    match connect_ws_with_path(
-        worker_domain,
+    match connect_cf_with_path(
         worker_domain,
         &path,
         false,
         skip_tls_verify,
         timeout,
         outbound,
-        None,
-        disable_tls,
+        opts,
     )
     .await
     {

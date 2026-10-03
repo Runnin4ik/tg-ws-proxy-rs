@@ -129,9 +129,40 @@ TG_CF_DISABLE_TLS=true tg-ws-proxy --cf-domain yourdomain.com
 ```
 
 This does not affect direct WebSocket connections to Telegram, which always use
-TLS. MTProto payloads retain their own transport encryption, but plaintext HTTP
-exposes the Cloudflare hostname and traffic metadata. Prefer the default TLS
-mode unless the network requires this workaround.
+TLS. The obfuscated MTProto stream itself is on the wire unencrypted: every
+frame's `auth_key_id` is readable and the obfuscation layer is recoverable from
+captured bytes (#123), so each connection through these tiers is identifiable.
+Acceptable for media traffic; not for text — the proxy prints a warning at
+startup whenever a configured CF tier can carry connections over plaintext.
+
+### `--cf-ip` — preferred Cloudflare edges
+
+Cloudflare normally resolves each `kws{N}` / Worker hostname to an anycast
+edge selected by DNS. On networks where that assigned edge is slow or blocked,
+`--cf-ip` can pin both Cloudflare tiers to one or more tested edge addresses:
+
+```bash
+# IPv4 and IPv6; comma-separated or repeat the flag
+tg-ws-proxy --cf-domain example.net \
+  --cf-ip 104.16.1.1,104.17.2.2,2606:4700::1
+
+# The same preferred edges also apply to Workers
+tg-ws-proxy --cf-worker-domain worker.example.dev \
+  --cf-ip 104.16.1.1 --cf-ip 2606:4700::1
+```
+
+The list is global, not per DC: these addresses select the **Cloudflare edge**,
+not the Telegram backend. The original hostname remains the TLS SNI and HTTP
+`Host`, so its certificate and Cloudflare routing still select the correct
+`kws{N}` record or Worker. Each logical connection rotates which IP gets first
+chance, then tries every configured address before declaring that hostname
+failed. While the list is set, CF connections never fall back to DNS; remove
+`--cf-ip` to restore normal DNS/anycast selection.
+
+This affects only the CF proxy and CF Worker tiers. Direct WS (`--dc-ip`),
+upstream MTProto proxies, and raw TCP fallback keep their existing targets.
+When `--outbound-proxy` is also set, its CONNECT/SOCKS destination is the
+selected CF IP rather than the hostname; SNI/Host remain unchanged.
 
 ### `--cf-balance` — round-robin load balancing
 

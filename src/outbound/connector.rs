@@ -74,6 +74,10 @@ impl OutboundConnector {
         self.config.proxy.as_ref().map(ProxyConfig::summary)
     }
 
+    pub(crate) fn connects_directly(&self, target_host: &str, target_port: u16) -> bool {
+        self.config.proxy.is_none() || self.should_bypass(target_host, target_port)
+    }
+
     pub async fn connect(
         &self,
         target_host: &str,

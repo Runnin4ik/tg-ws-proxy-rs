@@ -71,7 +71,7 @@ The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 
 A Jetpack Compose app in `android/` runs the same core as a library: paste the
 CLI flags, start/stop, open the `tg://proxy` link. Install the APK from the
-[Releases](../../releases) page, or build it from source — see
+[Releases](../../releases) page or [F-Droid](https://f-droid.org/packages/io.github.valnesfjord.tgwsproxyrs), or build it from source — see
 [docs/Android.md](docs/Android.md).
 
 ### OpenWrt
@@ -256,6 +256,7 @@ tg-ws-proxy [OPTIONS]
 | `--pinned-upstream <TIERS>` / `--pinned-media-upstream <TIERS>` | default ladder | Pin the upstream tier order (`ws,cfworker,cfproxy,mtproto,tcp`, try-order); the media flag overrides the base one for media connections, which otherwise inherit it (see [docs/Fallbacks.md](docs/Fallbacks.md#pinning-the-tier-order-per-traffic-class)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
 | `--cf-disable-tls` | off | Use plaintext `ws://` on port 80 for CF proxy and Worker connections; direct Telegram WS remains TLS |
+| `--cf-ip <IP>` | DNS | Preferred Cloudflare edge IPv4/IPv6 addresses for CF proxy and Worker connections (comma-separated/repeatable); tries every address, never DNS-falls back |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Always present this domain as the TLS SNI for direct WS connections (fronting), e.g. `sprinthost.ru`; needs `--dc-ip` |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
@@ -264,6 +265,7 @@ tg-ws-proxy [OPTIONS]
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
+| `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
