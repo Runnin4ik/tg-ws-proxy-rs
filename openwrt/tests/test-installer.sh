@@ -486,11 +486,24 @@ printf '#!/bin/sh\nn=$(cat "%s/pidof-calls" 2>/dev/null || printf 0)\nn=$((n + 1
     "$tmp" "$tmp" > "$tmp/fakebin-notready/pidof"
 chmod +x "$tmp/fakebin-notready/netstat" "$tmp/fakebin-notready/pidof"
 PATH="$tmp/fakebin-notready:$PATH"
+# The generated init script sets its own PATH -- @ROOT@/bin first -- so the stubs
+# the script itself runs have to be in there too. The fakebin dir above serves
+# the test shell, this copy serves the script; without it start() runs the host's
+# pidof and netstat and this test only passes when the stub binary happens to win
+# the write race.
+cp "$tmp/fakebin-notready/netstat" "$tmp/fakebin-notready/pidof" "$nr/bin/"
 : > "$ENTWARE_LOGFILE"
 if out="$("$ENTWARE_INIT" start 2>&1)"; then
     printf 'FAIL: the init script reported a failing binary as started\n' >&2
     exit 1
 fi
+# The stub is the only source of that file, so this says the script went through
+# it -- and therefore that the sequence above, not the host's own tools, decided
+# the timing.
+[[ -f "$tmp/pidof-calls" ]] || {
+    printf 'FAIL: the init script never used the pidof stub, so its timing is untested\n' >&2
+    exit 1
+}
 grep -Fq 'cannot bind 0.0.0.0:2443: Address in use' "$ENTWARE_LOGFILE" || {
     printf 'FAIL: the binary stderr never reached the log file\n' >&2
     exit 1
